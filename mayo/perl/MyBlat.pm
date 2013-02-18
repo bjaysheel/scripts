@@ -21,7 +21,8 @@ sub init {
 	my $self = shift;
 
 	$self->{blat_ref} = "/data2/bsi/reference/db/hg19.2bit";
-	$self->{blat_path} = "/projects/bsi/bictools/scripts/dev/jbhavsar/apps";
+	$self->{blat_lookup} = "/data2/bsi/staff_analysis/b.lookup/primer/lookup.tbx";
+	$self->{blat_path} = "/projects/bsi/bictools/apps/alignment/blat/34_x64";
 }
 
 sub execute {

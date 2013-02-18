@@ -77,6 +77,7 @@ my $results = GetOptions (\%options,
 						  'window|w=s',
 						  'minScore|m=s',
 						  'minIdentity|t=s',
+						  'lookup_dirl=s',
 						  'help|h') || pod2usage();
 
 ## display documentation
@@ -106,6 +107,7 @@ while (<IN>) {
 
 	## skip header/comments
 	next if ($_ =~ /^#/);
+	next if ($_ =~ /^chrom/); ## special case.
 
 	## for each variant create a fasta seq to be blat(ed)
 	my @data = split(/\t/,$_);
@@ -151,7 +153,6 @@ sub check_parameters {
 		}
 	}
 
-
 	$options{minScore} = 70 unless($options{minScore});
 	$options{minIdentity} = 90 unless($options{minIdentity});
 
@@ -159,8 +160,9 @@ sub check_parameters {
 
 	## be sure that blat executable is 64-bit and not 32-bit
 	## 32-bit could cause memory error.
-	$options{blat_path} = "/projects/bsi/bictools/scripts/dev/jbhavsar/apps" unless ($options{blat_path});
+	$options{blat_path} = "/projects/bsi/bictools/apps/alignment/blat/34_x64" unless ($options{blat_path});
 	$options{samtools_path} = "/projects/bsi/bictools/apps/alignment/samtools/samtools-0.1.18" unless ($options{samtools_path});
+	$options{lookup_dir} = "/data2/bsi/staff_analysis/m101236/blat_lookup";
 }
 
 #############################################################################
@@ -244,8 +246,12 @@ sub new_vcf_file {
 
 	open(IN, "<", $options{input}) or die "can not open $options{input} : $! \n";
 	open(OUT, ">", $options{output}) or die "can not open $options{output} : $! \n";
+	open(LOOKUP, ">", $options{lookup_dir}."/temp.bed") or die "can not open $options{lookup_dir}/temp.bed : $! \n";
+
 	while (<IN>) {
 		chomp $_;
+
+		next if ($_ =~ /^chrom/);
 
 		if ($_ =~ /^##/) {
 			## print original comments to new file
@@ -253,23 +259,31 @@ sub new_vcf_file {
 
 		} elsif ($_ =~ /^#/) {
 			## print ED comments before printing column header
-			print OUT "##INFO=<ID=ED,Number=1,Type=Integer,Description=\"Number of blat hits to reference genome, not counting self-hit\">\n";
+			#print OUT "##INFO=<ID=ED,Number=1,Type=Integer,Description=\"Number of blat hits to reference genome, not counting self-hit\">\n";
 			print OUT $_ ."\n";
 
 		} else {
 			## add ED value to each variant call.
 			my @data = split(/\t/, $_);
+			my @out_arr = @data[0..2];
+
 			my $start = $data[1]-$options{window};
 			my $end = $data[1]+$options{window};
 			my $key = $data[0].":".$start."-".$end;
 
 			if (exists $hash_ref->{$key}) {
-				$data[7] .= ";ED=".$hash_ref->{$key};
+				#$data[7] .= ";ED=".$hash_ref->{$key};
+				$out_arr[2] = $hash_ref->{$key};
+				print LOOKUP ($data[0] ."\t" . ($data[1]-$options{window}) . "\t" . ($data[1]+$options{window}) . "\t" . $hash_ref->{$key}."\n");
 			} else {
-				$data[7] .= ";ED=-1";
+				#$data[7] .= ";ED=-1";
+				$out_arr[2] = -1;
+				print LOOKUP ($data[0] ."\t" . ($data[1]-$options{window}) . "\t" . ($data[1]+$options{window}) . "\t1\n");
 			}
 
-			print OUT join("\t", @data)."\n";
+			#print OUT join("\t", @data)."\n";
+			print OUT join("\t", @out_arr)."\n";
+
 		}
 	}
 	close(IN);

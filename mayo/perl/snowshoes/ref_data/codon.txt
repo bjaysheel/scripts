@@ -1,0 +1,1 @@
+/data4/bsi/algorithm_dev/wangy3_algorithm_dev/fusion_transcript/SnowShoes-FTD_2.0_Build37/ref_fusion/codon.txt

@@ -1,0 +1,3930 @@
+#!/usr/local/biotools/perl/5.10.0/bin/perl
+
+use strict;
+use warnings;
+use DirHandle;
+
+#print "What is the project directory?\n";
+#my $project = <STDIN>;
+my $project = $ARGV[0];
+chomp $project;
+
+open (LOG, ">>$project/log.txt") or die "$!";
+
+system ("dos2unix $project/configure_file.txt");
+open (CON, "<", $project."/config_info.txt") or die "the file configure.txt could not be found, $!";
+my %config_hash;
+while (<CON>){
+	chomp $_;
+	next if ($_ =~ /^#/);
+
+	map { $config_hash{$1} = $2 if( /([^=]+)\s*=\s*([^=]+)/ ) } $_;
+}
+close(CON);
+
+check_config(\%config_hash);
+
+print "\n\nProject Folder: $project\nPerl Script Folder: $config_hash{snowshoes_home}\nReference data: $config_hash{refdata}\nRead Length: $config_hash{read_length}\nDistance between two partner genes: $config_hash{distance}\nRNA Lib Size: $config_hash{lib_size}\nMinimal Read Pair: $config_hash{minimal}\nMaximal Fusion Isoforms: $config_hash{max_fusion_isoform}\n\n";
+
+#########################################################################################
+# read in fusions to be filtered out from the black list
+open (FILTER, "$config_hash{refdata}/black_list_fusion.txt") or die "$!";
+my %filtered_fusion = ();		# keys: fusion; values: ++
+
+my $in = <FILTER>;
+while ($in = <FILTER>)
+{
+	chomp $in;
+	$filtered_fusion{$in}++;
+}
+close (FILTER);
+
+#########################################################################################
+system ("dos2unix $project/sample_info.txt");
+open (LANE, "$project/sample_info.txt") or die "the file sample_info.txt could not be found, $!";
+my @lanes;
+my $universal_count = 0;
+my %sample_info = ();
+my $sample_title = <LANE>;		# the title
+chomp $sample_title;
+while ($_ = <LANE>)
+{
+	chomp $_;
+	my @arr = split(/\t/, $_);
+	$lanes[$universal_count] = $arr[0];
+	my $sample = 's_'.$arr[0];
+	$sample_info{$sample} = $_;
+	$universal_count++;
+}
+close (LANE);
+
+###############################################################
+
+open (PROBLEM, ">$project/problems.txt") or die "$!";
+
+######################################################################################
+#######################################################################################
+
+my %fusion_pair_sample = ();		# key: fusion pair, sample; value: count
+my %fusion_gene_sample = ();		# key: fusion genesp; value: count
+#my $config_hash{read_length} = 50;
+my $dir_candidates = "$project/fusion_candidates";
+my @files = plainfiles ($dir_candidates);
+my $file;
+
+foreach $file (@files)
+{
+	if($file =~ m/\Q$dir_candidates\E\/(.+)_fusion_summary/)
+	{
+		my $sample = $1;
+
+		open (GENE, "$file") or die "$!";
+		#GenePair\tTotal_pairs\tPairs(g2)\tPairs(j2)\tPairs(gj)\tCluster_E1(g)\tCluster_E2(g)\tBiggest_Cluster_E1(g)\tBiggest_Cluster_E2(g)
+
+		$in = <GENE>;			# title
+		while ($in = <GENE>)
+		{
+			my @array = split(/\t/, $in);
+			if(!($filtered_fusion{$array[0]}))		# don't care about the filtered out fusions
+			{
+				my @genes = split(/_/, $array[0]);	# the first element if the gene pair
+				$fusion_pair_sample{$array[0]}{$sample}++;
+				$fusion_gene_sample{$genes[0]}{$sample}++;
+				$fusion_gene_sample{$genes[1]}{$sample}++;
+			}
+		}
+		close (GENE);
+	}
+}
+
+my %pair_end_dir = ();	# key: sample###key, and end mapping directions; values:  counts	# NOTE: for genome mapping pairs only.
+@files = plainfiles ($dir_candidates);
+
+foreach $file (@files)
+{
+	if ($file =~ m/\Q$dir_candidates\E\/(.+)_filtered_fusion_reads/)
+	# only genome
+	{
+		my $sample = $1;
+		print "$sample\n";
+
+		open (READ, "$file") or die "$!";
+		#Read_ID End1_Chr End1_Position Strand_1 TYPE End2_Chr End2_Position Strand_2 Type Gene1 Gene2
+		$in = <READ>;		#title
+		#first pass to record the pair with sufficent counts first
+		my %pair_c = ();
+		while ($in = <READ>)
+		{
+			chomp $in;
+			my @arr = split (/\t/, $in);
+			my $pair;
+			if($arr[9] lt $arr[10])	{	$pair = $arr[9].'_'.$arr[10];	}
+			else	{	$pair = $arr[10].'_'.$arr[9];	}
+
+			$pair_c{$pair}++;
+		}
+		close (READ);
+
+		# 2nd pass;
+		open (READ, "$file") or die "$!";
+		#Read_ID End1_Chr End1_Position Strand_1 TYPE End2_Chr End2_Position Strand_2 Type Gene1 Gene2
+		my $title = <READ>;		# title
+		chomp $title;
+		while ($in = <READ>)
+		{
+			chomp $in;
+			my @arr = split (/\t/, $in);
+			my $pair;
+
+			if($arr[9] lt $arr[10])
+			{
+				$pair = $arr[9].'_'.$arr[10];
+			}
+			else {	$pair = $arr[10].'_'.$arr[9];	}
+
+			my $sample_pair = $sample.'###'.$pair;
+#			if ($pair eq 'EEF2_OR7D2')	{	print "$sample_pair: $pair_c{$pair}\n";	}
+
+			# NOTE: this only makes sense for reads mapped to genome, since distances between reads mapped to exon junctions are difficult to calculate
+		#	if($pair_c{$pair}>=$config_hash{minimal})		### NOTE this was taken away because there is a later on condition depending on this
+		#	{
+				if(($arr[4] eq 'GENOME') && ($arr[8] eq 'GENOME'))
+				#Read_ID End1_Chr End1_Position Strand_1 TYPE End2_Chr End2_Position Strand_2 Type Gene1 Gene2
+				# my %pair_end_dir = ();	# key: sample###key, and end mapping directions; values:  counts	# NOTE: for genome mapping pairs only.
+				{
+					if($arr[9] lt $arr[10])
+					{
+						my $dir_end1 = $arr[3];
+						if(!($arr[3]))	{	$dir_end1 = 'f';	}		# forward are empty, reverse are 'r'
+
+						my $dir_end2 = $arr[7];
+						if(!($arr[7]))	{	$dir_end2 = 'f';	}
+
+						my $direction_both_ends = $dir_end1.'_'.$dir_end2;
+						$pair_end_dir{$sample_pair}{$direction_both_ends}++;
+
+					}
+					else
+					{
+						my $dir_end1 = $arr[7];
+						if(!($arr[7]))	{	$dir_end1 = 'f';	}		# forward are empty, reverse are 'r'
+
+						my $dir_end2 = $arr[3];
+						if(!($arr[3]))	{	$dir_end2 = 'f';	}
+
+						my $direction_both_ends = $dir_end1.'_'.$dir_end2;
+						$pair_end_dir{$sample_pair}{$direction_both_ends}++;
+					}
+				}
+			}
+	#	}
+	}
+}
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### number of junction, junction orientation, primer design region, etc
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+
+open (TEMP, "$project/results/mapping_good_for_primer_sequence_design_new.txt") or die "$!";
+open (OUT, ">$project/results/temp_mapping.txt") or die "$!";
+
+#Read_Seq        ReadID  Sample  Fusion_Pair     Map1    Map2    Overlap Map-Detail1     Map-Detail2
+$in = <TEMP>;
+print OUT $in;
+while ($in = <TEMP>)
+{
+	chomp $in;
+	my @arr = split (/\t/, $in);
+	my @fff = split (/###/, $arr[3]);
+	my %all_f = ();
+	foreach my $ff (@fff)
+	{
+		$all_f{$ff}++;
+	}
+	my @ffff = keys (%all_f);
+	my $count_f = scalar(@ffff);
+	if($count_f == 1)
+	{	print OUT "$arr[0]\t$arr[1]\t$arr[2]\t$ffff[0]\t$arr[4]\t$arr[5]\t$arr[6]\t$arr[7]\t$arr[8]\n";	}
+}
+
+close (OUT);
+close (TEMP);
+system ("mv $project/results/temp_mapping.txt $project/results/mapping_good_for_primer_sequence_design_new.txt");
+
+##############################################################################################
+open(INFO, "$project/results/mapping_good_for_primer_sequence_design_new.txt") or die "$!";
+# Read_Seq        ReadID  Sample  Fusion_Pair     Map1    Map2    overlap    Map-Detail1     Map-Detail2
+# GGGGTCATGTGTGGGGAGGCTCCCCTTCTATTTGGGGCTTGATGACTTTC      HWUSI-EAS1531:1:7:242:49#0/2    s_1     ERBB2_HDGF      14-50   1-21    8 lcl|E1:chr1:HDGF:NM_001126051:154978522:154979871:-:342-306:14-50       lcl|E29:chr17:ERBB2:NM_001005862:35137073:35137326:+:159-139:1-21
+
+my %pair_gene_dir = ();				# key: sample###pair; value: gene mapping direction;
+my %boundary_exon = ();				# key: sample###pair; and exon1###exon2; and overlap; value: exon mapping positions
+my %boundary_exon_not_sample_specific = ();	# key: pair,exon1###exon2, and overlap; value: mapping positions
+my %boundary_read = ();				# key: sample###pair; and exon1###exon2; and overlap; value: read mapping positions
+my %sample_exon_read_mappings = ();		# key: pair; sample, and exon mapping positions; value: mapping positions on junction spanning reads
+# NOTE: what is the purpose of setting up a non-sample specific hash? Ans: if a fusion gene has two unique tiling junction spanning reads acorss different samples, it should be identified as well.
+
+$in = <INFO>;
+while ($in = <INFO>)
+{
+	chomp $in;
+	my @arr = split(/\t/, $in);
+	my $sample = $arr[2];
+	my $pair = $arr[3];			#Pair is named in the alphabetical order of the two partners.
+
+	$arr[7] =~ s/lcl\|//;		# get rid of the 'lcl|' in the front of the exon inforamtion: lcl|E29:chr17:ERBB2:NM_001005862:35137073:35137326:+:159-139:1-21
+	$arr[8] =~ s/lcl\|//;
+	my @temp1 = split(/:/, $arr[7]);
+	my @temp2 = split(/:/, $arr[8]);
+	my $overlap = $arr[6];
+
+	my @map1;
+	my @map2;
+
+	# reorder the two partners alphabetically
+	if($temp1[2] lt $temp2[2])
+	{
+		@map1 = @temp1;
+		@map2 = @temp2;
+	}
+	else
+	{
+		@map1 = @temp2;
+		@map2 = @temp1;
+	}
+
+	my $dir_g = $map1[6].'_'.$map2[6];	# the orientation of the two partners; alphabetically
+	$dir_g =~ s/\+/f/g;
+	$dir_g =~ s/-/r/g;
+
+	my $sample_pair = $sample.'###'.$pair;	# s_1###pair;
+	$pair_gene_dir{$sample_pair} = $dir_g;
+
+	# E29:chr17:ERBB2:NM_001005862:35137073:35137326:+:159-139:1-21 (the format of exons, the 'lcl|' was removed already)
+	# the read specific mapping positions are removed at this step
+	my $e1 = $map1[0].':'.$map1[1].':'.$map1[2].':'.$map1[3].':'.$map1[4].':'.$map1[5].':'.$map1[6];
+	my $e2 = $map2[0].':'.$map2[1].':'.$map2[2].':'.$map2[3].':'.$map2[4].':'.$map2[5].':'.$map2[6];
+	# NOTE: these exon IDs need to be unique, so the mapping information was removed ...
+	my $exon_b = $e1.'###'.$e2;
+	my $mapping_be = $map1[7].'_'.$map2[7];	# the mapping information anchored on exon coordinates
+	my $mapping_read = $map1[8].'_'.$map2[8];	# the mapping information anchored on the read
+
+#	if($pair_end_dir{$sample_pair}{$exon_b}{$overlap})
+#	{	$pair_end_dir{$sample_pair}{$exon_b}{$overlap} = $pair_end_dir{$sample_pair}{$exon_b}{$overlap}.'###'.$dir_end;	}
+#	else	{	$pair_end_dir{$sample_pair}{$exon_b}{$overlap} = $dir_end;	}
+
+	if($boundary_exon{$sample_pair}{$exon_b}{$overlap})
+	{
+		$boundary_exon{$sample_pair}{$exon_b}{$overlap} = $boundary_exon{$sample_pair}{$exon_b}{$overlap}.'###'.$mapping_be;
+	}
+	else
+	{
+		$boundary_exon{$sample_pair}{$exon_b}{$overlap} = $mapping_be;
+	}
+
+	if($boundary_exon_not_sample_specific{$pair}{$exon_b}{$overlap})
+	{
+		$boundary_exon_not_sample_specific{$pair}{$exon_b}{$overlap} = $boundary_exon_not_sample_specific{$pair}{$exon_b}{$overlap}.'###'.$mapping_be;
+	}
+	else
+	{
+		$boundary_exon_not_sample_specific{$pair}{$exon_b}{$overlap} = $mapping_be;
+	}
+#	if($sample_exon_read_mappings{$pair}{$mapping_be})
+#	{
+#		if($sample_exon_read_mappings{$pair}{$mapping_be} !~ m/\Q$mapping_read\E/)
+#		{	$sample_exon_read_mappings{$pair}{$mapping_be} = $sample_exon_read_mappings{$pair}{$mapping_be}.'###'.$mapping_read;	}
+#	}
+#	else {	$sample_exon_read_mappings{$pair}{$mapping_be} = $mapping_read;	}
+	$sample_exon_read_mappings{$pair}{$mapping_be} = $mapping_read;
+}
+#}			# NOTE NOTE NOTE NOTE
+close (INFO);
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### number of junction, junction orientation, primer design region, etc
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+
+print LOG "\n########################################\nGet good quality and useful junctions and look at the orientiation of the mapping\n\n";
+
+## First get the exon sequences involved in fusion;
+
+open (EXON, "$project/exon_fusion.fasta") or die "$!";
+my %exon_id_seq = ();
+while ($in = <EXON>)
+{
+	if($in =~ m/>(.+)\n/)
+	{
+		my $id = $1;
+
+		$in = <EXON>;
+		chomp $in;
+		$exon_id_seq{$id} = $in;
+	}
+}
+close (EXON);
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### number of junction, junction orientation, primer design region, etc
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+my %encompassing_mapping_sample_pair_1 = ();		# key: sample###Pair; value: mapping positions on GENOME for the 1st gene (alphabetically)
+my %encompassing_mapping_sample_pair_2 = ();		# key: sample###Pair; value: mapping positions on GENOME for the 2nd gene (alphabetically)
+my @all_fusion_pairs_sample = keys(%boundary_exon);	# NOTE: sample###Pair
+
+foreach my $sample (keys(%sample_info))
+{
+	my %pair_sample = ();
+	foreach my $sp (@all_fusion_pairs_sample)
+	{
+		my @arr = split (/###/, $sp);
+		if($arr[0] eq $sample)
+		{
+			$pair_sample{$arr[1]}++; 	# key: pairs (A_B)
+		}
+	}
+
+	my $filtered_reads_f = $sample.'_fusion_reads_minimal_abundance_'.$config_hash{minimal}.'.txt';
+	open (FILTER, "$project/fusion_candidates/$filtered_reads_f") or die "this file: $filtered_reads_f: $!";
+
+	my %pair_count = ();	# key: pair; value: the number of encompassing reads
+	$in = <FILTER>;
+	while ($in = <FILTER>)
+	# Read_ID End1_ACC        End1_Position   Strand_1        Type    End2_ACC        End2_Position   Strand_2        Type	Gene1	Gene2	Sample
+	{
+		chomp $in;
+		my @array = split(/\t/, $in);
+		my $pair;
+
+		if(($array[4] eq 'GENOME') && ($array[8] eq 'GENOME'))		# only looked at the genome mapping, just like the "cluster" step
+		{
+			if($array[9] lt $array[10])
+			{
+				$pair = $array[9].'_'.$array[10];
+				if ($pair_sample{$pair})
+				{
+					if($pair_count{$pair} <=5)	# only take a limited number of genomic positions
+					{
+						my $p = $sample.'###'.$pair;
+						if ($encompassing_mapping_sample_pair_1{$p})	{	$encompassing_mapping_sample_pair_1{$p} = $encompassing_mapping_sample_pair_1{$p}.','.$array[2];	}
+						else {	$encompassing_mapping_sample_pair_1{$p} = $array[2];	}
+						$pair_count{$pair}++;
+
+						if ($encompassing_mapping_sample_pair_2{$p})	{	$encompassing_mapping_sample_pair_2{$p} = $encompassing_mapping_sample_pair_2{$p}.','.$array[6];	}
+						else {	$encompassing_mapping_sample_pair_2{$p} = $array[6];	}
+					}
+				}
+			}
+
+			else
+			{
+				$pair = $array[10].'_'.$array[9];
+				if ($pair_sample{$pair})
+				{
+					if($pair_count{$pair} <=20)		# this number is arbitrary; need to account for multipel fusion isoforms, so need a number that's bigger
+					{
+						my $p = $sample.'###'.$pair;
+						if ($encompassing_mapping_sample_pair_1{$p})	{	$encompassing_mapping_sample_pair_1{$p} = $encompassing_mapping_sample_pair_1{$p}.','.$array[6];	}
+						else {	$encompassing_mapping_sample_pair_1{$p} = $array[6];	}
+						$pair_count{$pair}++;
+
+						if ($encompassing_mapping_sample_pair_2{$p})	{	$encompassing_mapping_sample_pair_2{$p} = $encompassing_mapping_sample_pair_2{$p}.','.$array[2];	}
+						else {	$encompassing_mapping_sample_pair_2{$p} = $array[2];	}
+					}
+				}
+			}
+		}
+	}
+	close (FILTER);
+}
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+#	process the fusion gene information;
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+open (OUT, ">$project/results/fusion_summary_with_primer.txt") or die "$!";
+print OUT "Sample\tFusion_Candidate\tGenes_Mapping_Direction\tExon_Boundary_Fusion\tMapping_Orientation_Encompassing_Reads_Genome\tEnd_Mapping_Consistency\tExon1\tExon2\t#_Unique_Titling_Junction_Reads_in_ALL_SAMPLES\t#_Titling_Junction_Reads_in_Current_Sample\tMapping_Positions_on_Boundary_Exons\tPCR_Primer\tGene_Order_According_to_Primer\tMapping_Used_for_Primer\t$sample_title\n";
+
+my @all_fusion_pairs = keys(%boundary_exon_not_sample_specific);	# NOTE: all fusion pairs
+# my @all_fusion_pairs_sample = keys(%boundary_exon);	# NOTE: sample###Pair, this was declared already
+my %sample_pair_final = (); 		#key: sample###pair; value: lines;
+my %sample_fusion_mapping_used = ();	#key: pair; and boundary_exons; and overlap; value: mapping picked for primer design (360-330_1-20)
+my %line_used = ();		# not to keep redundant lines NOTE: this happens when there is overlap exons from the same gene
+my %isoform_count = ();		# the isoform count of a fusion: Key: pair; value: ++
+
+foreach my $fusion (@all_fusion_pairs)
+{
+	if(!($filtered_fusion{$fusion}))
+	{
+		my @b_exons = keys (%{$boundary_exon_not_sample_specific{$fusion}});	# Get all the boundary exon pairs
+		my %isoform_count_local = ();		# key: Mapping_Used_for_Primer; value: ++
+		foreach my $exon (@b_exons)		# $e1###$e2
+		{
+			my @overlaps = keys (%{$boundary_exon_not_sample_specific{$fusion}{$exon}});
+			foreach my $overlap (@overlaps)
+			{
+				my @exons = split(/###/, $exon);	# get two exons, in the alpha-betical order of the fusion partner genes
+				#E29:chr17:ERBB2:NM_001005862:35137073:35137326:+
+				my @first_exon = split(/:/, $exons[0]);
+				my @second_exon = split(/:/, $exons[1]);
+				my @mappings = split(/###/, $boundary_exon_not_sample_specific{$fusion}{$exon}{$overlap});
+				my $mapping_used_for_primer;
+
+				# get the exon mapping information
+				my $total_map = scalar(@mappings);
+
+				# NOTE: definition: the existance of multiple titling junction spanning reads = multiple unqiue exon mappings. But because of the mapping orientations differences, need to correct the orientation first, since two reads mapped to identidical postions on boundaries exons but in opposite directions don't count as titling junction reads
+
+				my %gene1_exon_map = ();	# Key: map position; value: ++
+			#	my %gene2_exon_map = ();
+				foreach my $m (@mappings)		# $m: 360-330_1-20
+				{
+					my @exon_m = split(/_/, $m);
+					my @m1 = split (/-/, $exon_m[0]);	# For 1st gene (alphabetically)
+
+					$gene1_exon_map{$m1[1]}++;	# one of the mapping positions will show up again and again, because it is the position on the exon as the junction point
+					$gene1_exon_map{$m1[0]}++;
+				}
+
+				my @gene1 = keys (%gene1_exon_map);	# all exon mapping positions for gene 1;
+				my $max_g;	# the most frequent mapping position on the boundary exon from gene 1 (NOTE: others are ignored, so only report one isoform per bounary exon pair)
+				my $max_count = 0;
+				foreach my $g1 (@gene1)
+				{
+					if($gene1_exon_map{$g1} > $max_count)
+					{
+						$max_count = $gene1_exon_map{$g1};
+						$max_g = $g1;
+					}
+				}
+				foreach my $g1 (@gene1)
+				{
+					if(($gene1_exon_map{$g1} == $max_count) && ($max_g != $g1))
+					{
+						if($g1 == ($first_exon[5]-$first_exon[4]))	{	$max_g = $g1;	}
+					}
+				}
+
+				my %unique_tiling = ();	#key: the other mapping coordinate; value: ++;
+				my %map_other = ();
+				foreach my $m (@mappings)
+				{
+					if($m =~ m/^\Q$max_g\E-(\d+)_/)
+					{
+						$unique_tiling{$1}++;
+						my @exon_m = split(/_/, $m);	# $m: 360-330_1-20
+						my @m2 = split (/-/, $exon_m[1]);	# for 2nd gene (alphabetically)
+						$map_other{$m2[0]}++;
+						$map_other{$m2[1]}++;
+					}
+
+					if($m =~ m/^(\d+)-\Q$max_g\E_/)
+					{
+						$unique_tiling{$1}++;
+						my @exon_m = split(/_/, $m);	# $m: 360-330_1-20
+						my @m2 = split (/-/, $exon_m[1]);	# for 2nd gene (alphabetically)
+						$map_other{$m2[0]}++;
+						$map_other{$m2[1]}++;
+					}
+				}
+				my @unique_one = keys(%unique_tiling);
+				my $unique_count1 = scalar(@unique_one);
+
+			#	if($fusion eq 'HPCAL4_SLC25A44')	{	print "$fusion: $unique_count1\n";	}
+				if($unique_count1 > 1)	# more than 1 unique tiling junction spanning reads
+				{
+					my @others = keys (%map_other);
+					my $max_g2;	# the most frequent mapping position on the boundary exon from gene 2 (NOTE: others are ignored, so only report one isoform per bounary exon pair)
+					my $max_count2 = 0;
+					foreach my $g2 (@others)
+					{
+						if($map_other{$g2} > $max_count2)
+						{
+							$max_count2 = $map_other{$g2};
+							$max_g2 = $g2;
+						}
+					}
+
+					foreach my $g2 (@others)
+					{
+						if(($map_other{$g2} == $max_count2) && ($max_g2 != $g2))
+						{
+							if($g2 == ($second_exon[5]-$second_exon[4]))	{	$max_g2 = $g2;	}
+						}
+					}
+					if($max_count2 > 1)
+					{
+						foreach my $m (@mappings)
+						{
+							my @exon_m = split(/_/, $m);
+							if(($exon_m[0] =~ m/^\Q$max_g\E-\d+/) || ($exon_m[0] =~ m/^\d+-\Q$max_g\E/))
+							{
+								if(($exon_m[1] =~ m/^\Q$max_g2\E-\d+/) || ($exon_m[1] =~ m/^\d+-\Q$max_g2\E/))
+								{
+									$mapping_used_for_primer = $m;		# $m: 360-330_1-20
+									last;		# find the first one; quit
+								}
+							}
+						}
+
+						#######################################################################
+						# get the two sequences of the two boundaries
+						my $exon1 = $exons[0];		# E30:chr20:CEP250:NM_007186:33553631:33556247:+
+						my $exon2 = $exons[1];
+						my @map1 = split (/:/, $exon1);
+						my @map2 = split (/:/, $exon2);
+
+						my $seq1 = $exon_id_seq{$exon1};
+						my $seq2 = $exon_id_seq{$exon2};
+
+						my @map12 = split (/_/, $mapping_used_for_primer);		# 360-330_1-20
+
+						my @map12_read = split (/_/, $sample_exon_read_mappings{$fusion}{$mapping_used_for_primer});
+					#	print "$fusion: $mapping_used_for_primer: $sample_exon_read_mappings{$fusion}{$mapping_used_for_primer}: @map12_read\n";
+					#	my $pause = <STDIN>;
+
+						my @po1 = split(/-/, $map12[0]);		# exon mapping positions
+						my @po2 = split(/-/, $map12[1]);
+
+						my @po1_read = split(/-/, $map12_read[0]);		# junction mapping positions
+						my @po2_read = split(/-/, $map12_read[1]);
+
+						if($po1_read[0]>$po1_read[0])	{	print "WARNING!! Line 711\n";	}
+						if($po2_read[0]>$po2_read[0])	{	print "WARNING!! Line 711\n";	}
+
+						my $se1 = $map1[5]-$map1[4];		# size of the exon
+						my $se2 = $map2[5]-$map2[4];
+
+						my $b_fusion;		# whether fusion happened between exon boundaries
+
+						my $bound1 = 0;		# number of time it happens at the boundary
+						my $bound2 = 0;		# number of time it happens at the boundary
+						if(($po1[0] == ($se1)) || ($po1[1] == ($se1)) || ($po1[0] == 1) || ($po1[1] == 1) )
+						{
+							$bound1++;
+						}
+						if(($po2[0] == ($se2)) || ($po2[1] == ($se2)) || ($po2[0] == 1) || ($po2[1] == 1))
+						{
+							$bound2++;
+						}
+
+						if ($bound1 && $bound2)
+						{
+							$b_fusion = 'YES';
+						}
+						else	{	$b_fusion = 'NO';	}
+
+						my $final_str = '';		# the primer region with the "##" in the middle
+						my $gene_dir_template;	# the order of genes according to primer design region
+
+						my $orientation = ($po1[1]-$po1[0])*($po2[1]-$po2[0]);
+					#	print "$fusion:\texon mapping: $mapping_used_for_primer\tread mapping: $sample_exon_read_mappings{$fusion}{$mapping_used_for_primer}\t$orientation\t$bound1:$bound2\t$b_fusion\n\n$seq1\n\n$seq2\n\n";
+						# if two fusion partners are in the same orientation;
+						if($orientation>0)
+						{
+							if($po1[1] > $po1[0])	# foward mapped to exon1 and exon2
+							{
+							#	print "forward mapping to both exons: $fusion\n";
+								# NOTE: checked. $po1_read[1] > $po1_read[0]; $po2_read[1] > $po2_read[0] NOTE: ALWAYS
+								if ($po1_read[0] > $po2_read[0])
+								{
+									if ((!($bound2)) && (!($bound1)))
+									{
+										my $sub2 = substr ($seq2, 0, $po2[1]);
+										$seq2 = $sub2;
+										my $sub1 = substr $seq1, $po1[0]-1;
+										my $shaved = substr $sub1, $overlap;
+										$seq1 = $shaved;
+									}
+
+									elsif(!($bound1))
+									{
+										my $sub1 = substr $seq1, ($po1[0]-1+$overlap);
+										$seq1 = $sub1;
+									}
+
+									elsif(!($bound2))
+									{
+										my $sub2 = substr $seq2, 0, ($po2[1] - $overlap);
+										$seq2 = $sub2;
+									}
+
+									if(($po2[1] == $se2) && ($po1[0] == 1))	# NOTE ### ### # NOTE ### ### # NOTE ### ### # NOTE ### ###
+									{
+										$final_str = $seq2.'##'.$seq1;
+										$gene_dir_template = $map2[2].'-'.$map1[2];
+									}
+								}
+								else
+								{
+									if ((!($bound2)) && (!($bound1)))
+									{
+										my $sub1 = substr ($seq1, 0, $po1[1]); 	# from 0 to $po1[1]
+										$seq1 = $sub1;
+										my $sub2 = substr $seq2, $po2[0]-1; 	# from $po2[0] to the end
+										my $shaved = substr $sub2, $overlap;
+										$seq2 = $shaved;
+									}
+									elsif(!($bound1))
+									{
+										my $sub1 = substr $seq1, 0, ($po1[1]-$overlap);
+										$seq1 = $sub1;
+									}
+									elsif(!($bound2))
+									{
+										my $sub2 = substr $seq2, ($po2[0]-1+$overlap);
+										$seq2 = $sub2;
+									}
+
+									if(($po1[1] == $se1) && ($po2[0] == 1))	# NOTE ### ### # NOTE ### ### # NOTE ### ### # NOTE ### ###
+									{
+										$final_str = $seq1.'##'.$seq2;
+										$gene_dir_template = $map1[2].'-'.$map2[2];
+									}
+								}
+							}
+							else	# reverse mapped to both exon1 and exon2
+							{
+							#	print "reverse mapping to both exons: $fusion\n";
+								if ($po1_read[0] < $po2_read[0])
+								{
+									if((!($bound2)) && (!($bound1)))
+									{
+										my $sub2 = substr ($seq2, 0, $po2[0]); 	# from 0 to x2
+										$seq2 = $sub2;
+										my $sub1 = substr $seq1, $po1[1]-1; 	# from y1 to the end
+										$seq1 = $sub1;
+										my $shaved = substr $sub1, $overlap;
+										$seq1 = $shaved;
+									}
+
+									elsif(!($bound1))
+									{
+										my $sub1 = substr $seq1, ($po1[1]-1+$overlap);
+										$seq1 = $sub1;
+									}
+
+									elsif(!($bound2))
+									{
+										my $sub2 = substr $seq2, 0, ($po2[0]-$overlap);
+										$seq2 = $sub2;
+									}
+
+									if(($po2[0] == $se2) && ($po1[1] == 1))	# NOTE ### ### # NOTE ### ### # NOTE ### ### # NOTE ### ###
+									{
+										$final_str = $seq2.'##'.$seq1;
+										$gene_dir_template = $map2[2].'-'.$map1[2];
+									}
+								}
+								else
+								{
+									if((!($bound2)) && (!($bound1)))
+									{
+										my $sub2 = substr $seq2, ($po2[1]-1); 	# from 0 to x2
+										my $shaved = substr $sub2, $overlap;
+										$seq2 = $shaved;
+
+										my $sub1 = substr $seq1, 0, $po1[0];
+										$seq1 = $sub1;
+									}
+									elsif(!($bound1))
+									{
+										my $sub1 = substr $seq1, 0, ($po1[0]-$overlap);
+										$seq1 = $sub1;
+									}
+									elsif(!($bound2))
+									{
+										my $sub2 = substr $seq2, ($po2[1] -1 + $overlap);
+										$seq2 = $sub2;
+									}
+
+									if(($po1[0] == $se1) && ($po2[1] == 1))	# NOTE ### ### # NOTE ### ### # NOTE ### ### # NOTE ### ###
+									{
+										$final_str = $seq1.'##'.$seq2;
+										$gene_dir_template = $map1[2].'-'.$map2[2];
+									}
+								}
+							}
+						}
+
+						else		# two fusion partners are in the opposite orientation
+						{
+							if($po1[0] < $po1[1]) # foward map to exon1, reverse map to exon 2
+							{
+							#	print "forward mapping to gene1, reverse mapping to gene2: $fusion\n";
+
+								if ($po1_read[0] < $po2_read[0])
+								{
+									if ((!($bound2)) && (!($bound1)))
+									{
+										my $sub2 = substr ($seq2, 0, $po2[0]); 	# from 0 to x2
+										$seq2 = $sub2;
+										my $sub1 = substr $seq1, 0, ($po1[1]-$overlap); 	# from 0 to y1
+										$seq1 = $sub1;
+									}
+
+									elsif(!($bound1))
+									{
+										my $sub1 = substr $seq1, 0, ($po1[1]-$overlap);
+										$seq1 = $sub1;
+									}
+
+									elsif(!($bound2))
+									{
+										my $sub2 = substr $seq2, 0, ($po2[0]-$overlap);
+										$seq2 = $sub2;
+									}
+
+									if(($po1[1] == $se1) && ($po2[0] == $se2))	# NOTE ### ### # NOTE ### ### # NOTE ### ### # NOTE ### ###
+									{
+										my $rev1 = reverse $seq1;
+										$rev1 =~ tr/ACGTacgt/TGCAtgca/;
+										$final_str = $seq2.'##'.$rev1;
+										$gene_dir_template = $map2[2].'-'.$map1[2];
+									}
+								}
+								else
+								{
+									if((!($bound2)) && (!($bound1)))
+									{
+										my $sub2 = substr $seq2, ($po2[1]-1);
+										$seq2 = $sub2;
+										my $shaved = substr $seq2, $overlap;
+										$seq2 = $shaved;
+
+										my $sub1 = substr $seq1, ($po1[0]-1);
+										$seq1 = $sub1;
+									}
+
+									elsif(!($bound1))
+									{
+										my $sub1 = substr $seq1, ($po1[0]-1);
+										my $shaved = substr $sub1, $overlap;
+										$seq1 = $shaved;
+									}
+
+									elsif(!($bound2))
+									{
+										my $sub2 = substr $seq2, ($po2[1]-1);
+										my $shaved = substr $sub2, $overlap;
+										$seq2 = $shaved;
+									}
+
+									if(($po1[0] == 1) && ($po2[1] == 1))	# NOTE ### ### # NOTE ### ### # NOTE ### ### # NOTE ### ###
+									{
+										my $rev1 = reverse $seq1;
+										$rev1 =~ tr/ACGTacgt/TGCAtgca/;
+
+										$final_str = $rev1.'##'.$seq2;
+										$gene_dir_template = $map1[2].'-'.$map2[2];
+									}
+								}
+							}
+
+							elsif ($po2[0] < $po2[1]) # reverse map to exon1 and forward map to exon2
+							{
+							#	print "reverse mapping to gene1, forward mapping to gene2: $fusion\n";
+
+								if ($po1_read[0] < $po2_read[0])
+								{	if((!($bound1)) && (!($bound2)))
+									{
+										my $sub1 = substr $seq1, $po1[1]-1; 	# from y1 to the end
+										$seq1 = $sub1;
+
+										my $sub2 = substr $seq2, $po2[0]-1; 	# from x2 to the end
+										$seq2 = $sub2;
+										my $shaved = substr $seq2, $overlap;
+										$seq2 = $shaved;
+									}
+									elsif(!($bound1))
+									{
+										my $sub1 = substr $seq1, ($po1[1]-1+$overlap); 	# from y1 to the end
+										$seq1 = $sub1;
+									}
+
+									elsif(!($bound2))
+									{
+										my $sub2 = substr $seq2, ($po2[0]-1+$overlap); 	# from x2 to the end
+										$seq2 = $sub2;
+									}
+
+									if(($po1[1] == 1) && ($po2[0] == 1))	# NOTE ### ### # NOTE ### ### # NOTE ### ### # NOTE ### ###
+									{
+										my $rev1 = reverse $seq1;
+										$rev1 =~ tr/ACGTacgt/TGCAtgca/;
+										$final_str = $rev1.'##'.$seq2;
+										$gene_dir_template = $map1[2].'-'.$map2[2];
+									}
+								}
+								else
+								{
+									if((!($bound1)) && (!($bound2)))
+									{
+										my $sub1 = substr $seq1, 0, ($po1[0]-$overlap);
+										$seq1 = $sub1;
+										my $sub2 = substr $seq2, 0, $po2[1]; 	# from x2 to the end
+										$seq2 = $sub2;
+									}
+
+									elsif(!($bound1))
+									{
+										my $sub1 = substr $seq1, 0, ($po1[0] - $overlap);
+										$seq1 = $sub1;
+									}
+									elsif(!($bound2))
+									{
+										my $sub2 = substr $seq2, 0, ($po2[1] - $overlap);
+										$seq2 = $sub2;
+									}
+
+									if(($po1[0] == $se1) && ($po2[1] == $se2))	# NOTE ### ### # NOTE ### ### # NOTE ### ### # NOTE ### ###
+									{
+										my $rev1 = reverse $seq1;
+										$rev1 =~ tr/ACGTacgt/TGCAtgca/;
+										$final_str = $seq2.'##'.$rev1;
+										$gene_dir_template = $map2[2].'-'.$map1[2];
+									}
+								}
+							}
+						}
+					#	print "$final_str\n\n";
+					#	my $pause = <STDIN>;
+						#######################################################################
+						my @all_samples = keys (%sample_info);
+				#		if($fusion eq 'EEF2_OR7D2') {	print "@all_samples\n";	}
+						foreach my $sample (@all_samples)
+						{
+							my @fusions = split (/###/, $fusion);		# NOTE: possible that multiple gene pairs in Fusion;
+							my $f_count = scalar(@fusions);
+							my %fusion_nr = ();
+							foreach my $f (@fusions)	{	$fusion_nr{$f}++;	}
+
+							my @fusions_nred = keys (%fusion_nr);
+
+							foreach my $f (@fusions_nred)
+							{
+								my $sample_pair = $sample.'###'.$f;
+								my @orientations = keys (%{$pair_end_dir{$sample_pair}});
+								if(@orientations)
+								# NOTE: some $sample and fusion combination doesn't exist, because the $fusion here is non-sample-specific!!!
+								{
+
+								#	if($fusion eq 'ATXN7L3_FAM171A2')	{	print "$sample_pair: @orientations\n";	}
+									my $c_ffrr = 0;
+									my $c_fr = 0;
+									foreach my $ori (@orientations)
+									{
+										my $c_ori = $pair_end_dir{$sample_pair}{$ori};
+										if(($ori eq 'f_r') || ($ori eq 'r_f'))	{	$c_fr = $c_fr + $c_ori;	}
+										if (($ori eq 'f_f') || ($ori eq 'r_r'))	{	$c_ffrr = $c_ffrr + $c_ori;	}
+									}
+
+									my $sum = $c_ffrr + $c_fr;
+									my $fraction = $c_fr/$sum;
+									my @mappings_sample = split(/###/, $boundary_exon{$sample_pair}{$exon}{$overlap});
+									my @mappings_used = ();
+									my $map_count = 0;
+									foreach my $q (@mappings_sample)
+									{
+										my @exon_m = split(/_/, $q);
+										if(($exon_m[0] =~ m/^\Q$max_g\E-(\d+)/) || ($exon_m[0] =~ m/^(\d+)-\Q$max_g\E/))
+										{
+											if(($exon_m[1] =~ m/^\Q$max_g2\E-(\d+)/) || ($exon_m[1] =~ m/^(\d+)-\Q$max_g2\E/))
+											{
+												$mappings_used[$map_count] = $q;
+												$map_count++;
+											}
+										}
+									}
+
+									my $end_map_consist;
+									if(($fraction<=0.1) || ($fraction>=0.9))	{	$end_map_consist = 'YES';	}
+									else	{	$end_map_consist = 'NO';	}
+
+							#		if ($f eq 'ATXN7L3_FAM171A2') {	print "ATXN7L3_FAM171A2: $sample: $map_count -- $end_map_consist\n";	}
+									if(($map_count) && ($end_map_consist eq 'YES') && ($b_fusion eq 'YES') && ($final_str))
+									# if the current sample has at least one junction spanning read
+									{
+										my $tem = $max_g.'_'.$max_g2;
+							#			if ($f eq 'ATXN7L3_FAM171A2') {	print "ATXN7L3_FAM171A2: $sample\n";	}
+										print OUT "$sample\t$f\t$pair_gene_dir{$sample_pair}\t$b_fusion\t|f_r|=$c_fr; |f_f|r_r|=$c_ffrr\t$end_map_consist\t$exons[0]\t$exons[1]\t$max_count2\t$map_count\t@mappings_used\t$final_str\t$gene_dir_template\t$tem\t$sample_info{$sample}\n";
+
+										$sample_pair_final{$sample_pair} = "$sample\t$f\t$pair_gene_dir{$sample_pair}\t$b_fusion\t|f_r|=$c_fr; |f_f|r_r|=$c_ffrr\t$end_map_consist\t$exons[0]\t$exons[1]\t$max_count2\t$map_count\t@mappings_used\t$final_str\t$gene_dir_template\t$tem\t$sample_info{$sample}\n";
+
+										$isoform_count_local{$tem}++
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		my @isoforms = keys (%isoform_count_local);
+
+		my @fusions_ii = split (/###/, $fusion);		# NOTE: possible that multiple gene pairs in Fusion;
+		my %fusion_nr_ii = ();
+		foreach my $f (@fusions_ii)	{	$fusion_nr_ii{$f}++;	}
+		my @fusions_nred_ii = keys (%fusion_nr_ii);
+
+		foreach my $f (@fusions_nred_ii)
+		{
+			my $t = scalar(@isoforms);
+			if ($isoform_count{$f} <= $t) { $isoform_count{$f} = $t;	}	## NOTE: critical!!
+			print PROBLEM "fusion: $fusion -- $f\t: @isoforms\n";
+
+		#	if ($f eq 'EEF2_OR7D2')
+		#	{
+		#		print "$f: @isoforms: $isoform_count{$f}\n";
+		#		my $pause = <STDIN>;
+		#	}
+
+		#	print "fusion: $fusion -- $f\t: @isoforms\t$isoform_count{$f}\n";
+		#	my $pause = <STDIN>;
+		}
+	}
+}
+close (OUT);
+
+
+################################################
+# get the final report
+#############################################
+
+@files = plainfiles($dir_candidates);
+my %additional_information_fusion = ();
+my %all_fusion_sample_additional = ();
+foreach $file (@files)
+{
+	if($file =~ m/\Q$dir_candidates\E\/(.+)_fusion_summary/)
+	{
+		my $sample = $1;
+		open (FUSION, "$file") or die "$!";
+		my $fusion_title = <FUSION>;
+		while ($in = <FUSION>)
+		{
+			my @arr = split(/\t/, $in);
+			my $sample_pair = $sample.'###'.$arr[0];
+			if($sample_pair_final{$sample_pair})
+			{
+				$additional_information_fusion{$sample_pair} = "$sample\t$arr[0]\t$arr[1]\t$arr[2]\t$arr[3]\t$arr[4]";
+			}
+			else
+			{
+				$all_fusion_sample_additional{$sample_pair} = "$sample\t$arr[0]\t$arr[1]\t$arr[2]\t$arr[3]\t$arr[4]";
+			}
+		}
+		close (FUSION);
+	}
+}
+open (FUSION, "$project/results/fusion_summary_with_primer.txt") or die "$!";
+open (OUT, ">$project/results/final_fusion_report.txt") or die "$!";
+print OUT "Sample\tGenePair\tTotal_pairs\tPairs(g2)\tPairs(j2)\tPairs(gj)\tSample\tGenePair\tGenes_Mapping_Direction\tExon_Boundary_Fusion\tMapping_Orientation_Encompassing_Reads_Genome\tMapping_Consistency_Encompassing_Reads_Genome\tExon1\tExon2\t#_Unique_Titling_Junction_Reads_in_ALL_SAMPLES\t#_Titling_Junction_Reads_in_Current_Sample\tMapping_Positions_on_Boundary_Exons\tPCR_Primer\tGene_Order_According_to_Primer\tMapping_Used_for_Primer\t$sample_title\n";
+
+$in = <FUSION>;
+my %used = (); 		# key: lines write out to the final_fusion_report.txt; value: ++.
+while ($in = <FUSION>)
+{
+	my @arr = split(/\t/, $in);
+	my $sample_pair = $arr[0].'###'.$arr[1];
+	print PROBLEM "Maximal Fusion isoform: $config_hash{max_fusion_isoform}\tfor $arr[1]: Number of Isoform = $isoform_count{$arr[1]}\n";
+#	if ($arr[1] eq 'ANP32E_PTMS')	{	print "$arr[1]: $isoform_count{$arr[1]}\n";	my $pause = <STDIN>;	}
+	if($isoform_count{$arr[1]} <= $config_hash{max_fusion_isoform})
+	{
+		print PROBLEM "Included in the final fusion reports!\n\n";
+		print OUT "$additional_information_fusion{$sample_pair}\t$in";
+#		if ($arr[1] eq 'ANP32E_PTMS')	{	print "$arr[1] included in the fusion reports\n";	my $pause = <STDIN>;	}
+
+		my @all_samples = keys (%sample_info);
+		foreach my $sample (@all_samples)
+		{
+			my $sample_pair_temp = $sample.'###'.$arr[1];
+			if(!($sample_pair_final{$sample_pair_temp}))
+			# in a sample that doesn't have junction spanning read(s), but have encompassing reads to support the fusion;
+			{
+				if($all_fusion_sample_additional{$sample_pair_temp})
+				{
+					my $line = "$all_fusion_sample_additional{$sample_pair_temp}\t$sample\t$arr[1]\t\t\t\t\t\t\t\t\t\t\t\t\t$sample_info{$sample}\n";
+					if (!($used{$line}))
+					{
+						print OUT "$all_fusion_sample_additional{$sample_pair_temp}\t$sample\t$arr[1]\t\t\t\t\t\t\t\t\t\t\t\t\t$sample_info{$sample}\n";
+						$used{$line}++;
+					}
+				}
+			}
+		}
+	}
+}
+close (OUT);
+close (FUSION);
+
+######################### ###  ###  ### ##### NOTE NOTE NOTE ##################
+# get the protein report
+######################### ###  ###  ### ##### NOTE NOTE NOTE ###############
+# get sample annotation data;
+my $end = "$project/results";
+#open (FUSE, "$end/Final_Matrix_CONFIDENT_Fusion_primer_seq.txt") or die "$!";
+open (FUSE, "$end/final_fusion_report.txt") or die "$!";
+my $title = <FUSE>;
+chomp $title;
+
+my @array_t = split (/\t/, $title);
+my $num_field = scalar(@array_t);
+########################################
+#	0	Sample
+#	1	GenePair
+#	2	Total_pairs
+#	3	Pairs(g2)
+#	4	Pairs(j2)
+#	5	Pairs(gj)
+#	6	Sample
+#	7	GenePair
+#	8	Genes_Mapping_Direction
+#	9	Exon_Boundary_Fusion
+#	10	Mapping_Orientation_Encompassing_Reads_Genome
+#	11	Mapping_Consistency_Encompassing_Reads_Genome
+#	12	Exon1
+#	13	Exon2
+#	14	#_Unique_Titling_Junction_Reads_in_ALL_SAMPLES
+#	15	#_Titling_Junction_Reads_in_Current_Sample
+#	16	Mapping_Positions_on_Boundary_Exons
+#	17	PCR_Primer
+#	18	Gene_Order_According_to_Primer
+#	19	Mapping_Used_for_Primer
+#	20	$sample_title
+###################################################################################
+# First round to get all the exons aligned to junction spanning reads;
+my %fusion_exons = (); 	# key: pair, exon: chr:start-end; value: involved in fusion genes
+my %fusion_genes = ();	# key: gene; value: exist and used in fusion
+my %no_junction_sample_lines = ();	# key: pair; value: all other samples with the encompassing reads, but no junction spanning reads;
+
+while ($in = <FUSE>)
+{
+	my @arr = split (/\t/, $in);
+	my @first_e = split(/:/, $arr[12]);		#E30:chr20:CEP250:NM_007186:33553631:33556247:+
+	my @second_e = split (/:/, $arr[13]);
+	my $e1 = $first_e[1].':'.$first_e[4].'-'.$first_e[5];	# need to do this because the Exon numbering was arbituary, ACC specific
+	my $e2 = $second_e[1].':'.$second_e[4].'-'.$second_e[5];
+
+	$fusion_exons{$arr[1]}{$e1}++;		# NOTE: critical to have the fusion pair as key. since a gene can be invovlved in multiple fusions
+	$fusion_exons{$arr[1]}{$e2}++;
+	$fusion_genes{$first_e[2]}++;
+	$fusion_genes{$second_e[2]}++;
+
+	if(!($arr[8]))
+	{
+		if($no_junction_sample_lines{$arr[1]})	{	$no_junction_sample_lines{$arr[1]} = $no_junction_sample_lines{$arr[1]}.'####'.$in;	}
+		else	{	$no_junction_sample_lines{$arr[1]} = $in;	}
+	}
+}
+close (FUSE);
+print "Done getting the exons (junction ones only) and genes involved in fusion\n";
+
+#######################################
+# get all exons/transcripts of the genes involved in fusion
+my %transcript_exons = ();
+my %gene_transcript = ();
+my %transcript_cds_start = ();
+my %transcript_cds_end = ();
+my %exon_useful_transcript = ();	# to record the exons that belong to transcripts with fusion junction exons
+open (UCSC, "$config_hash{refdata}/ucsc_refFlat_filtered.txt") or die "$!";
+$in = <UCSC>;	# title
+# Symbol       acc    chrom   strand  txStart txEnd   cdsStart        cdsEnd  exonCount       exonStarts      exonEnds
+while ($in = <UCSC>)
+{
+	chomp $in;
+	my @fields = split(/\t/, $in);
+	if($fusion_genes{$fields[0]})
+	{
+		my $exon_count = $fields[8];
+
+		my @starts = split(/,/, $fields[9]);
+		my @ends = split(/,/, $fields[10]);
+		my @pairs = keys (%fusion_exons);
+		foreach my $pair (@pairs)
+		{
+			my $found = 0;	# to indidate if the fusion junction boundary exon is part of this transcript
+			for(my $k=0; $k<$exon_count; $k++)
+			{
+				my $exo = $fields[2].':'.$starts[$k].'-'.$ends[$k];
+				if($fusion_exons{$pair}{$exo})
+				{
+					$found++;
+				}
+			}
+			if($found)
+			{
+				if($gene_transcript{$pair}{$fields[0]})
+				{	$gene_transcript{$pair}{$fields[0]} = $gene_transcript{$pair}{$fields[0]}.'#'.$fields[1];	}
+
+				else {	$gene_transcript{$pair}{$fields[0]} = $fields[1];	}
+
+				$transcript_cds_start{$fields[1]} = $fields[6];
+				$transcript_cds_end{$fields[1]} = $fields[7];
+
+				for(my $k=0; $k<$exon_count; $k++)
+				{
+					my $exo = $fields[2].':'.$starts[$k].'-'.$ends[$k];
+					$exon_useful_transcript{$exo}++;
+					if($transcript_exons{$fields[1]})
+					{	$transcript_exons{$fields[1]} = $transcript_exons{$fields[1]}.'#'.$exo;	}
+
+					else {	$transcript_exons{$fields[1]} = $exo;	}
+				}
+			}
+		}
+	}
+}
+close (UCSC);
+print "Done getting the exons and transcripts involved in fusion\n";
+
+########################################
+# get the sequence of the exons
+my %exon_seq = ();
+open (EXON, "$project/exon_fusion.fasta") or die "$!";
+# >E10:chr1:HECTD3:NM_024602:45245209:45245274:-
+$in = <EXON>;
+while (($in =~ m/^>/) && ($in))
+{
+	chomp $in;
+	my @ex = split(/:/, $in);
+	my $e = $ex[1].':'.$ex[4].'-'.$ex[5];
+	my $seq;
+
+	$in = <EXON>;
+	while (($in !~ m/^>/) && ($in))
+	{
+		chomp $in;
+		if(!($seq))	{	$seq = $in;	}
+		else	{	$seq = $seq.$in;	}
+		$in = <EXON>;
+	}
+
+	if($exon_useful_transcript{$e})	{	$exon_seq{$e} = $seq;	}
+}
+close (EXON);
+print "Done getting the exon seq for exons involved in fusion\n";
+
+############################################
+# readin the protein codon file
+my %codon_aa = ();	# key: codon; value: aa
+open (COD, "$config_hash{refdata}/codon.txt") or die "$!";
+while ($in = <COD>)
+{
+	chomp $in;
+	my @temp = split (/\t/, $in);
+	$codon_aa{$temp[0]} = $temp[1];
+}
+close (COD);
+print "Done reading in the codon table\n";
+
+##############################################
+# Second pass to annotate the results file
+open (FUSE, "$end/final_fusion_report.txt") or die "$!";
+$in = <FUSE>;		# the title
+########################################
+#	0	Sample
+#	1	GenePair
+#	2	Total_pairs
+#	3	Pairs(g2)
+#	4	Pairs(j2)
+#	5	Pairs(gj)
+#	6	Sample
+#	7	GenePair
+#	8	Genes_Mapping_Direction
+#	9	Exon_Boundary_Fusion
+#	10	Mapping_Orientation_Encompassing_Reads_Genome
+#	11	Mapping_Consistency_Encompassing_Reads_Genome
+#	12	Exon1
+#	13	Exon2
+#	14	#_Unique_Titling_Junction_Reads_in_ALL_SAMPLES
+#	15	#_Titling_Junction_Reads_in_Current_Sample
+#	16	Mapping_Positions_on_Boundary_Exons
+#	17	PCR_Primer
+#	18	Gene_Order_According_to_Primer
+#	19	Mapping_Used_for_Primer
+#	20	$sample_title
+########################################
+open (OUT, ">$end/final_fusion_report_interpreted.txt") or die "$!";
+print OUT "Sample\tFusion_pair_Alphabetical\tFUSION_GENE_directional\tType\tPotential_Fusion_Mechanism\tFusion_Strand\t$array_t[2]\t$array_t[3]\t$array_t[4]\t$array_t[5]\t$array_t[10]\t$array_t[8]\t$array_t[9]\t$array_t[12]\t$array_t[13]\t$array_t[14]\t$array_t[15]\t$array_t[17]\t$array_t[18]\t$array_t[19]\t$sample_title\tWARNING\n";
+
+open (PROTEIN, ">$end/Fusion_protein_results.txt") or die "$!";
+print PROTEIN "FUSION\tNOTE\tTranscripts\tIn_frame\tJunction_Point_Mutations\tBoundary_Exon_5'_Gene\tBoundary_Exon_3'_Gene\tFusion_Transcript_Coding_Seq\tFusion_Protein_Seq\n";
+
+my %no_junction_sample_used = ();	# key: pair; value: ++
+
+while ($in = <FUSE>)
+{
+	chomp $in;
+	my @arr = split (/\t/, $in);
+	my $sample = $arr[0];
+	my $pair = $arr[1];
+	my $sample_pair = $sample.'###'.$pair;
+#	if($pair eq 'EEF2_OR7D2')	{	print "$sample_pair\n";	}
+
+	if($arr[16])		# some lines are for samples with no junction spanning reads to support the fusion gene
+	{
+		my @first_e = split(/:/, $arr[12]);	#E15:chr16:ABCC1:NM_019898:16077683:16077759:+
+		my @second_e = split (/:/, $arr[13]);
+
+		my $gene1 = $first_e[2];
+		my $gene2 = $second_e[2];
+
+		my $ori_1 = $first_e[6];
+		my $ori_2 = $second_e[6];
+
+		my $size_e1 = $first_e[5]- $first_e[4];
+		my $size_e2 = $second_e[5] - $second_e[4];
+
+		my @ex_boundary_map = split(/_/, $arr[19]);	# the two positions in two boundary exons that are at the junction (125-233)
+		my $ex_m1 = $ex_boundary_map[0] + $first_e[4];
+		my $ex_m2 = $ex_boundary_map[1] + $second_e[4];		#alphabetical, actuall genomic position
+
+		my @all_mapping = split (/ /, $arr[16]);		# mapping coordinates on Exons: 120-84_13-1 100-120_1-29
+		my @mappings;
+		my @map1;
+		my @map2;
+		for my $all_map (@all_mapping)		# make sure the one used is the right one.
+		{
+			if(($all_map =~ m/\Q$ex_boundary_map[0]\E/) && ($all_map =~ m/\Q$ex_boundary_map[1]\E/))
+			{
+				@mappings = split (/_/, $all_map);
+				@map1 = split (/-/, $mappings[0]);
+				@map2 = split (/-/, $mappings[1]);
+				last;
+			}
+		}
+
+		my @map1_sorted = sort {$a<=>$b} @map1;
+		my @map2_sorted = sort {$a<=>$b} @map2;
+
+		my $inversion;
+		my $fusion;
+		my $direction;
+		my $type;
+		my $translocation;
+		my $deletion;
+		my $warning;
+
+		if($first_e[1] ne $second_e[1])
+		{
+			$type = 'inter-chr';
+			$translocation = 'YES';
+		}
+		else	{	$type = 'intra-chr';	}
+
+		my @encompassing_map1 = split (/,/, $encompassing_mapping_sample_pair_1{$sample_pair});
+		my @encompassing_map2 = split (/,/, $encompassing_mapping_sample_pair_2{$sample_pair});
+
+		# NOTE: to get only the positions that are within library size ($config_hash{lib_size}) distance from the junction ... BECAUSE: these encompassing reads might cluster according to fusion isoforms
+		my @encompassing_map1_s = sort {$a<=>$b} @encompassing_map1;
+		my @encompassing_map2_s = sort {$a<=>$b} @encompassing_map2;
+		my $size1 = scalar (@encompassing_map1_s);
+		my $size2 = scalar (@encompassing_map2_s);
+
+		my $en_s1 = 0;
+		my $en_s2 = 0;
+	#	print "$pair\nE1 mapping: $ex_m1\tE2 mapping: $ex_m2\nE1 Encompassing: @encompassing_map1_s\nE2 Encompassing: @encompassing_map2_s\n\n";
+	#	my $pause = <STDIN>;
+
+		# first to seperate the positions into clusters
+		my %encompassing_map1_cluster = ();
+		my $begin = $encompassing_map1_s[0];
+		$encompassing_map1_cluster{$en_s1} = $begin;
+		for (my $m=1; $m<$size1; $m++)
+		{
+			my $dis = $encompassing_map1_s[$m] - $begin;
+			if ($dis <= ($config_hash{lib_size}))
+			{
+				$encompassing_map1_cluster{$en_s1} = $encompassing_map1_cluster{$en_s1}.'#'.$encompassing_map1_s[$m];
+			}
+			else
+			{
+				$en_s1++;
+				$begin = $encompassing_map1_s[$m];
+				$encompassing_map1_cluster{$en_s1} = $begin;
+			}
+		}
+
+		# first to seperate the positions into clusters
+		my %encompassing_map2_cluster = ();
+		$begin = $encompassing_map2_s[0];
+		$encompassing_map2_cluster{$en_s2} = $begin;
+		for (my $m=1; $m<$size2; $m++)
+		{
+			my $dis = $encompassing_map2_s[$m] - $begin;
+			if ($dis <= ($config_hash{lib_size}))
+			{
+				$encompassing_map2_cluster{$en_s2} = $encompassing_map2_cluster{$en_s2}.'#'.$encompassing_map2_s[$m];
+			}
+			else
+			{
+				$en_s2++;
+				$begin = $encompassing_map2_s[$m];
+				$encompassing_map2_cluster{$en_s2} = $begin;
+			}
+		}
+
+		my @smaller1 = ();
+		# for gene 1, the number of times the encompassing reads mapping coordinates are smaller than the junction reads mapping
+		my @biger1 = ();
+
+		my @smaller2 = ();
+		# for gene 1, the number of times the encompassing reads mapping coordinates are smaller than the junction reads mapping
+		my @biger2 = ();
+
+		# go through all clusters of encompassing reads
+		for(my $x=0; $x<=$en_s1; $x++)
+		{
+			my @tempp1 = split (/#/, $encompassing_map1_cluster{$x});
+			my $sizzz1 = scalar(@tempp1);
+			for (my $h=0; $h<$sizzz1; $h++)		#E15:chr16:ABCC1:NM_019898:16077683:16077759:+
+			{
+				my $start = $first_e[4] + $map1_sorted[0];	# doesn't have to be accurate to the exact position
+				my $end = $first_e[4] + $map1_sorted[1];
+				if($encompassing_map1_s[$h] >= $end)	{	$biger1[$x]++;	}
+				if($encompassing_map1_s[$h] <= $start)	{	$smaller1[$x]++;	}
+			}
+		}
+		for(my $y=0; $y<=$en_s2; $y++)
+		{
+			my @tempp2 = split (/#/, $encompassing_map2_cluster{$y});
+			my $sizzz2 = scalar(@tempp2);
+			for (my $h=0; $h<$sizzz2; $h++)		#E15:chr16:ABCC1:NM_019898:16077683:16077759:+
+			{
+				my $start = $second_e[4] + $map2_sorted[0];	# doesn't have to be accurate to the exact position
+				my $end = $second_e[4] + $map2_sorted[1];
+				if($encompassing_map2_s[$h] >= $end)	{	$biger2[$y]++;	}
+				if($encompassing_map2_s[$h] <= $start)	{	$smaller2[$y]++;	}
+			}
+		}
+
+		if (($ori_1 eq '+') && ($ori_2 eq '-'))
+		{
+
+			if(($ex_boundary_map[0] == $size_e1) && ($ex_boundary_map[1] == $size_e2)) 	# map to the end of an exon from the forward gene # map to the start of an exon from the reverse gene
+			{
+				$inversion = 'YES';
+				$fusion = $gene1.'->'.$gene2;
+				$direction = '+';
+				if($first_e[1] eq $second_e[1])	# same chromosome
+				{
+					if($first_e[4] > $second_e[4])		# the start of the exons
+					{	$translocation = 'YES';	}
+				}
+			}
+			elsif(($ex_boundary_map[0] == 1) && ($ex_boundary_map[1] == 1))	# map to the start of an exon from the forward gene # map to the end of an exon from the reverse gene
+			{
+				$inversion = 'YES';
+				$fusion = $gene2.'->'.$gene1;
+				$direction = '-';
+				if($first_e[1] eq $second_e[1])	# chr
+				{
+					if($first_e[4] > $second_e[4])		# the start of the exons
+					{	$translocation = 'YES';	}
+				}
+			}
+			else
+			{
+				my $done = 0;
+				for(my $x=0; $x<=$en_s1; $x++)
+				{
+					for(my $y=0; $y<=$en_s2; $y++)
+					{
+						if(($smaller1[$x] > $biger1[$x]) && ($smaller2[$y] > $biger2[$y]))
+						{
+							$inversion = 'YES';
+							$fusion = $gene1.'->'.$gene2;
+							$direction = '+';
+							if($first_e[1] eq $second_e[1])	# chr
+							{
+								if($first_e[4] > $second_e[4])		# the start of the exons
+								{	$translocation = 'YES';	}
+							}
+							$done++;
+							last;
+						}
+
+						elsif(($smaller1[$x] < $biger1[$x]) && ($smaller2[$y] < $biger2[$y]))
+						{
+							$inversion = 'YES';
+							$fusion = $gene2.'->'.$gene1;
+							$direction = '-';
+							if($first_e[1] eq $second_e[1])	# chr
+							{
+								if($first_e[4] > $second_e[4])		# the start of the exons
+								{	$translocation = 'YES';	}
+							}
+							$done++;
+							last;
+						}
+					}
+					if($done)	{	last;	}
+				}
+
+				if(!($done))
+				{
+					$fusion = $gene1.'-'.$gene2;
+					$direction = 'Can Not Determine';
+					$inversion = 'Can Not Determine';
+				}
+			}
+		}
+
+		if (($ori_1 eq '-') && ($ori_2 eq '+'))
+		{
+			if(($ex_boundary_map[0]  == $size_e1) && ($ex_boundary_map[1] == $size_e2))	# map to the start of an exon from the reverse gene # map to the end of an exon from the forward gene
+			{
+				$inversion = 'YES';
+				$fusion = $gene2.'->'.$gene1;
+				$direction = '+';
+
+				if($first_e[1] eq $second_e[1])	# chr
+				{
+					if($first_e[4] < $second_e[4])		# the start of the exons
+					{	$translocation = 'YES';	}
+				}
+			}
+			elsif(($ex_boundary_map[0] == 1) && ($ex_boundary_map[1] == 1)) # map to the end of an exon from the reverse gene # map to the start of an exon from the forward gene
+			{
+				$inversion = 'YES';
+				$fusion = $gene1.'->'.$gene2;
+				$direction = '-';
+
+				if($first_e[1] eq $second_e[1])	# chr
+				{
+					if($first_e[4] < $second_e[4])		# the start of the exons
+					{	$translocation = 'YES';	}
+				}
+			}
+			else
+			{
+				my $done = 0;
+				for(my $x=0; $x<=$en_s1; $x++)
+				{
+					for(my $y=0; $y<=$en_s2; $y++)
+					{
+						if(($smaller1[$x] > $biger1[$x]) && ($smaller2[$y] > $biger2[$y]))
+						{
+							$inversion = 'YES';
+							$fusion = $gene2.'->'.$gene1;
+							$direction = '+';
+
+							if($first_e[1] eq $second_e[1])	# chr		### NOTE
+							{
+								if($first_e[4] < $second_e[4])		# the start of the exons
+								{	$translocation = 'YES';	}
+							}
+							$done++;
+							last;
+						}
+
+						elsif(($smaller1[$x] < $biger1[$x]) && ($smaller2[$y] < $biger2[$y]))
+						{
+							$inversion = 'YES';
+							$fusion = $gene1.'->'.$gene2;
+							$direction = '-';
+
+							if($first_e[1] eq $second_e[1])	# chr		### NOTE
+							{
+								if($first_e[4] < $second_e[4])		# the start of the exons
+								{	$translocation = 'YES';	}
+							}
+
+							$done++;
+							last;
+						}
+					}
+					if($done)	{	last;	}
+				}
+
+				if(!($done))
+				{
+					$fusion = $gene1.'-'.$gene2;
+					$direction = 'Can Not Determine';
+					$inversion = 'Can Not Determine';
+				}
+			}
+		}
+
+		if (($ori_1 eq '+') && ($ori_2 eq '+'))
+		{
+			if(($ex_boundary_map[0] == $size_e1) && ($ex_boundary_map[1] == 1))	# map to the end of an exon from the forward gene # map to the start of an exon from the forward gene
+			{
+				$inversion = 'NO';
+				$fusion = $gene1.'->'.$gene2;
+				$direction = '+';
+				if($first_e[1] eq $second_e[1])	# chr
+				{
+					if($first_e[5] < $second_e[4])		# the start/end of the exons
+					{	$deletion = 'YES';	}
+					else {	$translocation = 'YES';	}
+				}
+			}
+
+			elsif(($ex_boundary_map[0] == 1) && ($ex_boundary_map[1] == $size_e2))	# map to the start of an exon from the forward gene # map to the end of an exon from the forward gene
+			{
+				$inversion = 'NO';
+				$fusion = $gene2.'->'.$gene1;
+				$direction = '+';
+
+				if($first_e[1] eq $second_e[1])	# chr
+				{
+					if($first_e[4] > $second_e[5])		# the start/end of the exons
+					{	$deletion = 'YES';	}
+					else {	$translocation = 'YES';	}
+				}
+			}
+			else
+			{
+				my $done = 0;
+				for(my $x=0; $x<=$en_s1; $x++)
+				{
+					for(my $y=0; $y<=$en_s2; $y++)
+					{
+						if(($smaller1[$x] > $biger1[$x]) && ($smaller2[$y] < $biger2[$y]))
+						{
+							$inversion = 'NO';
+							$fusion = $gene1.'->'.$gene2;
+							$direction = '+';
+
+							if($first_e[1] eq $second_e[1])	# chr		### NOTE
+							{
+								if($first_e[4] > $second_e[4])		# the start of the exons
+								{	$translocation = 'YES';	}
+								else	{	$deletion = 'YES';	}
+							}
+							$done++;
+							last;
+						}
+
+						elsif(($smaller1[$x] < $biger1[$x]) && ($smaller2[$y] > $biger2[$y]))
+						{
+							$inversion = 'NO';
+							$fusion = $gene2.'->'.$gene1;
+							$direction = '+';
+
+							if($first_e[1] eq $second_e[1])	# chr		### NOTE
+							{
+								if($first_e[4] < $second_e[4])		# the start of the exons
+								{	$translocation = 'YES';	}
+								else	{	$deletion = 'YES';	}
+							}
+							$done++;
+							last;
+						}
+					}
+					if($done)	{	last;	}
+				}
+
+				if(!($done))
+				{
+					$fusion = $gene1.'-'.$gene2;
+					$direction = 'Can Not Determine';
+					$inversion = 'Can Not Determine';
+				}
+			}
+		}
+
+		if (($ori_1 eq '-') && ($ori_2 eq '-'))
+		{
+			if(($ex_boundary_map[0] == $size_e1) && ($ex_boundary_map[1] == 1))	# map to the start of an exon from the reverse gene
+			{
+				$inversion = 'NO';
+				$fusion = $gene2.'->'.$gene1;
+				$direction = '-';
+				if($first_e[1] eq $second_e[1])	# chr
+				{
+					if($first_e[5] < $second_e[4])		# the start/end of the exons
+					{	$deletion = 'YES';	}
+					else {	$translocation = 'YES';	}
+				}
+			}
+
+			elsif(($ex_boundary_map[0] == 1) && ($ex_boundary_map[1] == $size_e2))	# map to the end of an exon from the reverse gene
+			{
+				$inversion = 'NO';
+				$fusion = $gene1.'->'.$gene2;
+				$direction = '-';
+
+				if($first_e[1] eq $second_e[1])	# chr
+				{
+					if($first_e[4] > $second_e[5])		# the start/end of the exons
+					{	$deletion = 'YES';	}
+					else {	$translocation = 'YES';	}
+				}
+			}
+			else
+			{
+				my $done = 0;
+				for(my $x=0; $x<=$en_s1; $x++)
+				{
+					for(my $y=0; $y<=$en_s2; $y++)
+					{
+						if(($smaller1[$x] > $biger1[$x]) && ($smaller2[$y] < $biger2[$y]))
+						{
+							$inversion = 'NO';
+							$fusion = $gene2.'->'.$gene1;
+							$direction = '-';
+
+							if($first_e[1] eq $second_e[1])	# chr		### NOTE
+							{
+								if($first_e[4] > $second_e[4])		# the start of the exons
+								{	$translocation = 'YES';	}
+								else	{	$deletion = 'YES';	}
+							}
+							$done++;
+							last;
+						}
+
+						elsif(($smaller1[$x] < $biger1[$x]) && ($smaller2[$y] > $biger2[$y]))
+						{
+							$inversion = 'NO';
+							$fusion = $gene1.'->'.$gene2;
+							$direction = '-';
+
+							if($first_e[1] eq $second_e[1])	# chr		### NOTE
+							{
+								if($first_e[4] < $second_e[4])		# the start of the exons
+								{	$translocation = 'YES';	}
+								else	{	$deletion = 'YES';	}
+							}
+							$done++;
+							last;
+						}
+					}
+					if($done)	{	last;	}
+				}
+
+				if(!($done))
+				{
+					$fusion = $gene1.'-'.$gene2;
+					$direction = 'Can Not Determine';
+					$inversion = 'Can Not Determine';
+				}
+			}
+		}
+
+		#Sample\tFUSION_GENE\tType\tPotential_Fusion_Mechanism\tFusion_Strand\t$array_t[2]\t$array_t[3]\t$array_t[4]\t$array_t[5]\t$array_t[10]\t$array_t[8]\t$array_t[9]\t$array_t[12]\t$array_t[13]\t$array_t[14]\t$array_t[15]\t$array_t[17]\t$array_t[18]\t$array_t[19]\t$sample_title\tWARNING\n
+#		if($pair eq 'EEF2_OR7D2')	{	print "Fusion Gene: EEF2_OR7D2, Direction: $direction\n";	}
+		if(($direction ne 'Can Not Determine') && ($fusion =~ m/->/) )
+#		if($fusion =~ m/->/)
+		{
+			if(!($deletion) && !($translocation))
+			{
+				print OUT "$sample\t$pair\t$fusion\t$type\tI AND (D OR T)\t$direction\t$arr[2]\t$arr[3]\t$arr[4]\t$arr[5]\t$arr[10]\t$arr[8]\t$arr[9]\t$arr[12]\t$arr[13]\t$arr[14]\t$arr[15]\t$arr[17]\t$arr[18]\t$arr[19]\t$sample_info{$sample}\t$warning\n";
+			}
+			elsif ($inversion eq 'YES')
+			{
+				if($translocation eq 'YES')	# it's not possible that deletion is YES when inversion is YES
+				{	print OUT "$sample\t$pair\t$fusion\t$type\tI AND T\t$direction\t$arr[2]\t$arr[3]\t$arr[4]\t$arr[5]\t$arr[10]\t$arr[8]\t$arr[9]\t$arr[12]\t$arr[13]\t$arr[14]\t$arr[15]\t$arr[17]\t$arr[18]\t$arr[19]\t$sample_info{$sample}\t$warning\n";	}
+			}
+			elsif ($inversion eq 'NO')
+			{
+				if($deletion eq 'YES')
+				{	print OUT "$sample\t$pair\t$fusion\t$type\tD OR T\t$direction\t$arr[2]\t$arr[3]\t$arr[4]\t$arr[5]\t$arr[10]\t$arr[8]\t$arr[9]\t$arr[12]\t$arr[13]\t$arr[14]\t$arr[15]\t$arr[17]\t$arr[18]\t$arr[19]\t$sample_info{$sample}\t$warning\n";	}
+
+				else
+				{	print OUT "$sample\t$pair\t$fusion\t$type\tT\t$direction\t$arr[2]\t$arr[3]\t$arr[4]\t$arr[5]\t$arr[10]\t$arr[8]\t$arr[9]\t$arr[12]\t$arr[13]\t$arr[14]\t$arr[15]\t$arr[17]\t$arr[18]\t$arr[19]\t$sample_info{$sample}\t$warning\n";	}
+			}
+			elsif ($inversion eq 'Can Not Determine')
+			{
+				print OUT "$sample\t$pair\t$fusion\t$type\tT\t$direction\t$arr[2]\t$arr[3]\t$arr[4]\t$arr[5]\t$arr[10]\t$arr[8]\t$arr[9]\t$arr[12]\t$arr[13]\t$arr[14]\t$arr[15]\t$arr[17]\t$arr[18]\t$arr[19]\t$sample_info{$sample}\t$warning\n";
+			}
+
+			######## NOTE: get the other samples if they only have encompassing reads, but not junction spanning reads;
+			if (!($no_junction_sample_used{$pair}))
+			{
+				my @other_lines = split(/####/, $no_junction_sample_lines{$pair});
+				foreach my $line (@other_lines)
+				{
+					chomp $line;
+					my @others = split (/\t/, $line);
+					print OUT "$others[0]\t$others[1]\t\t\t\t\t$others[2]\t$others[3]\t$others[4]\t$others[5]\t\t$arr[8]\t\t\t\t\t\t\t\t\t$sample_info{$others[0]}\t$warning\n";
+				}
+				$no_junction_sample_used{$pair}++;
+			}
+
+
+			###&&&&&&&&&&&&&&&&&&&&###&&&&###&&&&###&&&&###&&&&###&&&&###&&###&&&&&&&&&&&&&&&&&&&&###&&&&###&&&&###&&&&###&&&&###&&&&###&&
+			# write out putative protein sequences of the fusion products
+			###&&&&&&&&&&&&&&&&&&&&###&&&&###&&&&###&&&&###&&&&###&&&&###&&###&&&&&&&&&&&&&&&&&&&&###&&&&###&&&&###&&&&###&&&&###&&&&###&&
+			#	0	Sample
+			#	1	GenePair
+			#	2	Total_pairs
+			#	3	Pairs(g2)
+			#	4	Pairs(j2)
+			#	5	Pairs(gj)
+			#	6	Sample
+			#	7	GenePair
+			#	8	Genes_Mapping_Direction
+			#	9	Exon_Boundary_Fusion
+			#	10	Mapping_Orientation_Encompassing_Reads_Genome
+			#	11	Mapping_Consistency_Encompassing_Reads_Genome
+			#	12	Exon1
+			#	13	Exon2
+			#	14	#_Unique_Titling_Junction_Reads_in_ALL_SAMPLES
+			#	15	#_Titling_Junction_Reads_in_Current_Sample
+			#	16	Mapping_Positions_on_Boundary_Exons
+			#	17	PCR_Primer
+			#	18	Gene_Order_According_to_Primer
+			#	19	Mapping_Used_for_Primer
+			#	20	$sample_title
+			########################################
+			if($fusion =~ m/->/) 		# not to deal with the fusion partners with no known direction
+			{
+				my @member = split(/->/, $fusion);
+				my $g1 = $member[0];
+				my $g2 = $member[1];
+				my $pair_alphabetical;
+				if($g1 lt $g2) {	$pair_alphabetical = $g1.'_'.$g2;	}
+				else {	$pair_alphabetical = $g2.'_'.$g1;	}
+				my @transcripts1_pre = split(/#/, $gene_transcript{$pair_alphabetical}{$g1});
+				my @transcripts2_pre = split(/#/, $gene_transcript{$pair_alphabetical}{$g2});
+				my @ex_mb = split (/_/, $arr[19]);	# exon coordinates that are at the boundary of the fusion
+
+				my $junction_exon1;
+				my $junction_exon2;
+				my $dir1;
+				my $dir2;
+				my $ex_b1;
+				my $ex_b2;
+
+				# E1:chr7:TAX1BP1:NM_001079864:27746262:27746413:+
+				if($g1 eq $first_e[2])		# NOTE: except for $fusion; all other values are still in alphabetical order
+				{
+					$junction_exon1 = $first_e[1].':'.$first_e[4].'-'.$first_e[5];
+					$junction_exon2 = $second_e[1].':'.$second_e[4].'-'.$second_e[5];
+					$dir1 = $first_e[6];
+					$dir2 = $second_e[6];
+					$ex_b1 = $ex_mb[0];
+					$ex_b2 = $ex_mb[1];
+				}
+				elsif($g2 eq $first_e[2])
+				{
+					$junction_exon2 = $first_e[1].':'.$first_e[4].'-'.$first_e[5];
+					$junction_exon1 = $second_e[1].':'.$second_e[4].'-'.$second_e[5];
+					$dir2 = $first_e[6];
+					$dir1 = $second_e[6];
+					$ex_b2 = $ex_mb[0];
+					$ex_b1 = $ex_mb[1];
+				}
+
+				my @transcripts1 = ();
+				my @transcripts2 = ();
+				my $count_t1 = 0;
+				my $count_t2 = 0;
+
+				my $fff = 0;
+				foreach my $t_1st (@transcripts1_pre)
+				{
+					my @eee = split (/#/, $transcript_exons{$t_1st});
+					foreach my $e (@eee)
+					{
+						if ($e eq $junction_exon1)
+						{
+							$fff++;;
+						}
+					}
+					if($fff)
+					{
+						$transcripts1[$count_t1] = $t_1st;
+						$count_t1++
+					}
+				}
+
+				$fff = 0;
+
+				foreach my $t_2nd (@transcripts2_pre)
+				{
+					my @eee = split (/#/, $transcript_exons{$t_2nd});
+					foreach my $e (@eee)
+					{
+						if ($e eq $junction_exon2)
+						{
+							$fff++;
+						}
+					}
+					if($fff)
+					{
+						$transcripts2[$count_t2] = $t_2nd;
+						$count_t2++;
+					}
+				}
+
+				if(($dir1 eq '+') && ($dir2 eq '+'))		# both at forward direction
+				{
+					for(my $k=0; $k<$count_t1; $k++)		# for each transcript of gene1
+					{
+						my @exon1 = split(/#/, $transcript_exons{$transcripts1[$k]});
+						my $ec1 = scalar(@exon1);
+						my $cds_start1 = $transcript_cds_start{$transcripts1[$k]};
+						my $cds_end1 = $transcript_cds_end{$transcripts1[$k]};
+						my $seq1;		# the coding region of transcript1
+
+						my $multi1;
+
+						my $index_cds1;	# the exon index of where the start codon belongs to
+						my $index_cds_end1;	# the exon index of where the end codon belongs to
+						my $index_b_e1;	# the exon index of the boundary exon
+						my $boundary1;
+
+						for(my $l=0; $l<$ec1; $l++)		# go through all exons of the first transcript
+						{
+							if($exon1[$l] =~ m/:(.+)-(.+)$/)
+							{
+								my $start = $1;
+								my $end = $2;
+								# find the exon with the start cds
+								if(($end >= $cds_start1) && ($start <= $cds_start1))	{	$index_cds1 = $l;	}
+								# find the exon with the end cds
+								if(($end >= $cds_end1) && ($start <= $cds_end1))	{	$index_cds_end1 = $l;	}
+								# found the boundary exon
+								if($exon1[$l] eq $junction_exon1)
+								{
+									$index_b_e1 = $l;
+									$boundary1= $start + $ex_b1;		# the actual boundary
+								}
+							}
+						}
+
+						### ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ###
+						if(($cds_start1 <= $boundary1) && ($boundary1 < ($cds_end1 + 2)))		# NOTE: new
+						# if the coding of transcript1 starts before the fusion bounday, AND, fusion happens before the the end of the stop codon;
+						{
+							if($exon1[$index_cds1] =~ m/:(.+)-(.+)$/)
+							{
+								my $start = $1;
+								my $off = $cds_start1 - $start;		# 0-based start; 1-based end
+								$seq1 = substr $exon_seq{$exon1[$index_cds1]}, $off;	# take off the bases before ATG
+							}
+							my $new_start1 = $index_cds1 + 1;	# starting the next exon, if any, till the boundary exon
+							for(my $l=$new_start1; $l<=$index_b_e1; $l++)
+							{
+								$seq1 = $seq1.$exon_seq{$exon1[$l]};
+							}
+
+							# need to take of the substr from junction site to the boundary
+							if($exon1[$index_b_e1] =~ m/:(.+)-(.+)$/)
+							{
+								my $start = $1;		# NOTE: Start and End are genomic cooridinates, while $ex_b1 is exon relative
+								my $end = $2;
+								my $off = ($end - $start - $ex_b1)*(-1);
+								if($off != 0)	{	$seq1 = substr $seq1, 0, $off;	}	# NOTE: if Off == 0; the $seq will be assinged to 0!!!
+							}
+
+							my $distance1 = length ($seq1);
+							$multi1 = $distance1 % 3;
+
+							my $leftover_1;	# the last $multi1 bases from Seq1;
+							my $offset_temp = (-1)* $multi1;
+							$leftover_1 = substr $seq1, $offset_temp, $multi1; 	# the last $multi1 bases from Seq1;
+
+							##########################################################
+							# now process the 2nd gene transcripts
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+								my $cds_start2 = $transcript_cds_start{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_end{$transcripts2[$m]};
+								my $seq2;		# the coding region of transcript2 that are fused in;
+								my $fused_out2;		# the coding region of transcript2 that are fused out
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+								my $multi2;
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								my $boundary2;
+
+								my $in_frame;
+
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))	{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))	{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+											$boundary2= $start + $ex_b2;		# the actual boundary
+										}
+									}
+								}
+
+								if(($cds_start2 < $boundary2) && ($boundary2 < $cds_end2))
+								# if the coding starts in the exon before the fusion bounday exon, AND, fusion happens before the stop codon;
+								{
+									#need to calculate how much of the coding region were fused out
+									if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										my $off = $cds_start2 - $start;					# 0-based start; 1-based end
+										$fused_out2 = substr $exon_seq{$exon2[$index_cds2]}, $off;	# take off the bases before ATG
+									}
+									my $new_start2 = $index_cds2 + 1;	# starting the next exon, if any, till BEFORE the boundary exon
+									for(my $a=$new_start2; $a<=$index_b_e2; $a++)
+									{
+										$fused_out2 = $fused_out2.$exon_seq{$exon2[$a]};
+									}
+
+									if($exon2[$index_b_e2] =~ m/:(.+)-(.+)$/)		# take off the end
+									{
+										my $off = ($2 - $1 - ($ex_b2-1))*(-1);
+										if($off != 0)	{	$fused_out2 = substr $fused_out2, 0, $off;	}
+									}
+									### get the coding regions that are fused in ($seq2)
+									for(my $a=$index_b_e2; $a<=$ec2; $a++)
+									{
+										if($seq2)	{	$seq2 = $seq2.$exon_seq{$exon2[$a]};	}
+										else	{	$seq2 = $exon_seq{$exon2[$a]};	}
+
+									}
+
+									# need to get rid of the first part of the boundary exon
+									if($ex_b2 != 1)	{	$seq2 = substr $seq2, ($ex_b2-1);	}		# Take off the string in front of $ex_b2
+
+
+									my $distance2 = length($fused_out2);
+									$multi2 = $distance2 % 3;
+
+									my $mutation;
+									my $in_frame_2;	# trimmed Seq2 from the begining, so Seq2 is in frame
+									my $old_na;
+									my $new_na;
+									my $old_aa;
+									my $new_aa;
+									if(($multi2 == 0) && ($multi1 == 0))	{	$in_frame = 'YES';	}
+									elsif($multi1 == $multi2)
+									{
+										$in_frame = 'YES';
+										my $offf = (-1)*$multi2;
+										my $track_back_2 = substr $fused_out2, $offf, $multi2;	# the last $mult2 bases from fused out2
+										$offf = 3 - $multi2;
+										my $t2_remain = substr $seq2, 0, $offf;		# fectch the base from $seq2;
+
+										$in_frame_2 = substr $seq2, $offf;	# the the reminaing in frame seq of seq2;
+										$new_na = $leftover_1.$t2_remain;	# new is the fused product
+										$old_na = $track_back_2.$t2_remain;	# old is the Seq2
+										$old_aa = $codon_aa{$old_na};
+										$new_aa = $codon_aa{$new_na};
+										if(($new_na ne $old_na) || ($new_aa ne $old_aa))	{	$mutation++;	}
+									}
+
+									# translation of the fusion transcript
+									my $prot1 = translation ($seq1);	# if there is leftover, it won't be used
+									my $prot2;
+									my $prot2_mut;
+									if ($in_frame_2)	{	$prot2_mut = translation($in_frame_2);	}
+								#	else
+								#	{
+										my $new_seq2 = $leftover_1.$seq2;
+										$prot2 = translation($new_seq2);
+								#	}
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+
+									if($mutation)
+									{
+										print PROTEIN "$fusion\tcoding to coding fusion\t$acc\t$in_frame\t$old_na->$new_na($old_aa->$new_aa)\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\t$prot1##$new_aa##$prot2_mut\n";
+									}
+									else
+									{
+										print PROTEIN "$fusion\tcoding to coding fusion\t$acc\t$in_frame\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\t$prot1##$prot2\n";
+									}
+								}
+
+								elsif($cds_start2 >= $boundary2)
+								# if the coding starts after the fusion boundary
+								{
+									my $non_coding_2;		#sequence from the boundary till the ATG
+									my $coding;
+									for(my $a=$index_b_e2; $a<=$index_cds2; $a++)
+									{
+										if($non_coding_2)
+										{
+											$non_coding_2 = $non_coding_2.$exon_seq{$exon2[$a]};
+										}
+										else
+										{
+											$non_coding_2 = $exon_seq{$exon2[$a]};
+										}
+									}
+
+									$coding = $exon_seq{$exon2[$index_cds2]};	# entire exon seq
+									if($ex_b2 != 1)	{	$non_coding_2 = substr $non_coding_2, ($ex_b2-1);	}# take off bases before the fusion junction,
+
+
+									if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+									{
+										my $off = (-1)*($2-$cds_start2+1);	# "+1" is to include the starting base of the Start Codon
+										if($off != 0)
+										{	$non_coding_2 = substr $non_coding_2, 0, $off;	}	# take off end: from cds start to the end
+
+										my $rel = $cds_start2 - $1 - 1;
+										$coding = substr $coding, $rel;		# take of the base before starting codon
+									}
+
+
+									my $new_start = $index_cds2 + 1;
+									for(my $a=$new_start; $a<$ec2; $a++)
+									{
+										$coding = $coding.$exon_seq{$exon2[$a]};
+									}
+								#	print "Noncoding: $non_coding_2\n\nCoding: $coding\n";
+								#	my $pause = <STDIN>;
+									# translation of the fusion transcript
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+
+									my $prot1 = translation ($seq1);
+									my $prot2 = translation ($coding);
+									my $combined = $leftover_1.$non_coding_2;
+									my $multi_non_coding = (length ($combined)) % 3;
+									my $insert;
+
+									if ($multi_non_coding == 0)
+									{
+										my $insert2 = translation($combined);
+										if($insert2 !~ m/\*/)
+										{	$in_frame = 'YES';	}
+										print PROTEIN "$fusion\tCoding of $g1 fused to 5' of $g2\t$acc\t$in_frame\tINSERTION:$combined($insert2)\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$non_coding_2$coding\t$prot1##$insert2##$prot2\n";
+									}
+									else
+									{
+										my $seq_all = $leftover_1.$non_coding_2.$coding;
+										my $prot2_out =  translation($seq_all);
+										print PROTEIN "$fusion\tCoding of $g1 fused to 5' of $g2\t$acc\t$in_frame\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$non_coding_2$coding\t$prot1##$prot2_out\n";
+									}
+								}
+
+								elsif($boundary2 >= $cds_end2)
+								# fusion happens after or at stop codon
+								{
+									for(my $a=$index_b_e2; $a<=$ec2; $a++)
+									{
+
+										if($seq2)	{	$seq2 = $seq2.$exon_seq{$exon2[$a]};	}
+										else {		$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+
+									if($ex_b2 != 1)	{	$seq2 = substr $seq2, ($ex_b2-1);	}		# Take off the string in front of $ex_b2
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+
+									my $prot1 = translation ($seq1);
+									my $combined = $leftover_1.$seq2;
+									my $prot2 = translation ($combined);
+									print PROTEIN "$fusion\tCoding of $g1 fused to the 3' UTR of $g2\t$acc\t$in_frame\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\t$prot1##$prot2\n";
+								}
+							}
+						}
+
+						elsif($boundary1  < $cds_start1)
+						# if the coding of transcript1 starts after the fusion bounday (NOTE: ALL Coding Regions of T1 are fused out)
+						{
+							for(my $b= 0; $b<$index_b_e1; $b++)
+							{
+								if($seq1)	{	$seq1 = $seq1.$exon_seq{$exon1[$b]};	}
+								else {		$seq1 = $exon_seq{$exon1[$b]};	}
+							}
+
+							my $temp_be_seq = $exon_seq{$exon1[$index_b_e1]};
+							if($ex_b1 != 1)
+							{	$temp_be_seq = substr ($temp_be_seq, 0, $ex_b1);	}	# get rid of the seq after the junction points
+							if($seq1)	{	$seq1 = $seq1.$temp_be_seq;	}
+							else	{	$seq1 = $temp_be_seq;	}
+					#		print "$fusion: bOUNDARY: $ex_b1\nBoundary EXON: $seq1\n\n";
+
+							##########################################################
+							# now process the 2nd gene transcripts
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+								my $cds_start2 = $transcript_cds_start{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_end{$transcripts2[$m]};
+								my $seq2;		# the coding region of transcript2 that are fused in;
+								my $fused_out2;		# the coding region of transcript2 that are fused out
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+
+								my $multi2;
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								my $boundary2;
+
+								my $in_frame;
+
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))	{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))	{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+											$boundary2= $start + $ex_b2;
+										}
+									}
+								}
+
+
+								if(($cds_start2 < $boundary2) && ($boundary2 < $cds_end2))
+								# if the coding starts before the fusion bounday, AND, fusion happens before the stop codon;
+								{
+									### get the coding regions that are fused in ($seq2)
+									for(my $a=$index_b_e2; $a<=$ec2; $a++)
+									{
+										if($seq2)	{	$seq2 = $seq2.$exon_seq{$exon2[$a]};	}
+										else	{	$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+
+									# need to get rid of the first part of the boundary exon
+									$seq2 = substr $seq2, ($ex_b2-1);			# Take off the string in front of $ex_b2
+								#	print "$fusion: bOUNDARY: $ex_b2\nBoundary EXON: $seq2\n\n";
+
+									# translation of the fusion transcript
+									my $seq = $seq1.$seq2;
+									my $prot = translation ($seq);
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+
+									print PROTEIN "$fusion\t5'UTR of $g1 fused into the coding region of $g2\t$acc\tNOT_Evaluated\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\t...$prot\n";
+								}
+
+								elsif($cds_start2 >= $boundary2)
+								# if the coding starts after the fusion boundary, and by default fusion happens before stop codon
+								{
+									for(my $a=$index_b_e2; $a<$ec2; $a++)
+									{
+										if($seq2)
+										{
+											$seq2 = $seq2.$exon_seq{$exon2[$a]};
+										}
+										else
+										{
+											$seq2 = $exon_seq{$exon2[$a]};
+										}
+									}
+
+									$seq2 = substr $seq2, ($ex_b2-1);
+
+									# translation of the fusion transcript
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+
+									my $prot = translation($seq2);
+									{
+										print PROTEIN "$fusion\t5'UTR of $g1 fused into the 5' UTR of $g2 \t$acc\tYES\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\tAssuming: intact protein for $transcripts2[$m]\n";
+									}
+								}
+
+								elsif($boundary2 >= $index_cds_end2)
+								# fusion happens after stop codon
+								{
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									print PROTEIN "$fusion\t5'UTR of $g1 fused into the 3' UTR of $g2\t$acc\tNA\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t\t\n";
+								}
+							}
+						}
+
+						elsif($boundary1 >= ($cds_end1+2))
+						# if fusion happens after the stop codon NOTE: ALL Coding Regions of T1 are fused in) and the stop codon of gene1 stops anything from happening to gene 2
+						{
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+								my $cds_start2 = $transcript_cds_start{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_end{$transcripts2[$m]};
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))
+										{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))
+										{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+										}
+									}
+								}
+								my $e2c = $index_b_e2+1;
+								my $e1c = $index_b_e1+1;
+
+								print PROTEIN "$fusion\t3'UTR of $g1 fused into $g2, No $g2 in the fused protein\t$acc\tYES($g1)\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t\tthe entire $g1 protein from $transcripts1[$k]\n";
+							}
+						}
+					}
+				}
+
+				#####################################################################################################
+				if(($dir1 eq '+') && ($dir2 eq '-'))		# forward and Reverse
+				{
+					for(my $k=0; $k<$count_t1; $k++)		# for each transcript of gene1
+					{
+						my @exon1 = split(/#/, $transcript_exons{$transcripts1[$k]});
+						my $ec1 = scalar(@exon1);
+						my $cds_start1 = $transcript_cds_start{$transcripts1[$k]};
+						my $cds_end1 = $transcript_cds_end{$transcripts1[$k]};
+						my $seq1;		# the coding region of transcript1
+						my $boundary1;
+
+						my $multi1;
+
+						my $index_cds1;	# the exon index of where the start codon belongs to
+						my $index_cds_end1;	# the exon index of where the end codon belongs to
+						my $index_b_e1;	# the exon index of the boundary exon
+						for(my $l=0; $l<$ec1; $l++)		# go through all exons of the first transcript
+						{
+							if($exon1[$l] =~ m/:(.+)-(.+)$/)
+							{
+								my $start = $1;
+								my $end = $2;
+								# found the exon with the start cds
+								if(($end >= $cds_start1) && ($start <= $cds_start1))	{	$index_cds1 = $l;	}
+								# found the exon with the end cds
+								if(($end >= $cds_end1) && ($start <= $cds_end1))	{	$index_cds_end1 = $l;	}
+								# found the boundary exon
+								if($exon1[$l] eq $junction_exon1)
+								{
+									$index_b_e1 = $l;
+									$boundary1 = $start +  $ex_b1;		# the actual boundary
+								}
+							}
+						}
+
+						### ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ###
+						if(($cds_start1 <= $boundary1) && ($boundary1 < ($cds_end1 + 2)))		# NOTE: new
+						# if the coding of transcript1 starts before the fusion bounday, AND, fusion happens before the stop codon;
+						{
+							if($exon1[$index_cds1] =~ m/:(.+)-(.+)$/)
+							{
+								my $start = $1;
+								my $off = $cds_start1 - $start;					# 0-based start; 1-based end
+								$seq1 = substr $exon_seq{$exon1[$index_cds1]}, $off;		# take off the bases before ATG
+							}
+							my $new_start1 = $index_cds1 + 1;	# starting the next exon, if any, till the boundary exon
+							for(my $l=$new_start1; $l<=$index_b_e1; $l++)
+							{
+								$seq1 = $seq1.$exon_seq{$exon1[$l]};
+							}
+
+							# need to take off the substr from junction site to the boundary
+							if($exon1[$index_b_e1] =~ m/:(.+)-(.+)$/)
+							{
+								my $start = $1;		# NOTE: Start and End are genomic cooridinates, while $ex_b1 is exon relative
+								my $end = $2;
+								my $off = ($end - $start - $ex_b1)*(-1);
+								if($off != 0)	{	$seq1 = substr $seq1, 0, $off;	}	# NOTE: if Off == 0; the $seq will be assinged to 0!!!
+							}
+
+							my $distance1 = length ($seq1);
+							$multi1 = $distance1 % 3;
+
+							my $leftover_1;	# the last $multi1 bases from Seq1;
+							my $offset_temp = (-1)* $multi1;
+							$leftover_1 = substr $seq1, $offset_temp, $multi1; 	# the last $multi1 bases from Seq1;
+
+							##########################################################
+							# now process the 2nd gene transcripts
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+
+								# NOTE: for a reverse gene, cds_start is the end, and cds_end is the start; # NOTE NOTE NOTE verified with the refFlat file
+								my $cds_start2 = $transcript_cds_end{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_start{$transcripts2[$m]};
+
+								my $seq2;		# the coding region of transcript2 that are fused in;
+								my $fused_out2;		# the coding region of transcript2 that are fused out
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+								my $multi2;
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								my $boundary2;
+
+								my $in_frame;
+
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))	{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))	{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+											$boundary2 = $start + $ex_b2;		# the actual boundary
+										}
+									}
+								}
+							#	print "$fusion: LeftOver Gene1: $leftover_1\nCDS Starts: $cds_start1 - $cds_start2: Boundary: $boundary1: $boundary2\n";
+
+								if(($cds_start2 > $boundary2) && ($boundary2 > ($cds_end2-2)))	# NOTE: CDS start and end positions are already in reverse order
+								# if the coding starts in the exon before the fusion bounday exon, AND, fusion happens before the stop codon;
+								{
+									# need to calculate how much of the coding region were fused out
+									if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $2;
+										my $end = $1;
+										my $off =  $cds_start2 - $end;
+										$fused_out2 = substr $exon_seq{$exon2[$index_cds2]}, 0, $off;
+										# keep ATG to end; still in reverse direction NOTE: the case of $off == 0; is validated
+									}
+
+									my $new_start2 = $index_cds2 - 1;	# starting the exon before, if any, till BEFORE the boundary exon
+									for(my $a=$new_start2; $a>=$index_b_e2; $a--)
+									{
+										$fused_out2 = $exon_seq{$exon2[$a]}.$fused_out2;
+									}
+									$seq2 = $fused_out2;
+									$seq2 = substr $seq2, 0, $ex_b2;			# get the string in front of $ex_b2 as the fused in
+
+									$fused_out2 = substr $fused_out2, $ex_b2;		# Take off the string in front of $ex_b2, not including the $ex_b2 base
+									my $distance2 = length($fused_out2);
+									$multi2 = $distance2 % 3;
+
+									### get the rest of the coding coding regions that are fused in ($seq2)
+									for(my $a=($index_b_e2-1); $a>=0; $a--)
+									{
+										if($seq2)	{	$seq2 = $exon_seq{$exon2[$a]}.$seq2;	}
+										else	{	$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+
+									my $mutation;
+									my $in_frame_2;	# trimmed Seq2 from the begining, so Seq2 is in frame
+									my $old_na;
+									my $new_na;
+									my $old_na_r;
+									my $old_aa;
+									my $new_aa;
+									if(($multi2 == 0) && ($multi1 == 0))	{	$in_frame = 'YES';	}
+									elsif($multi1 == $multi2)
+									{
+										$in_frame = 'YES';
+										my $track_back_2 = substr $fused_out2, 0, $multi2;	# the first $mult2 bases from fused out2
+										my $offf = (-1)*(3 - $multi2);
+										my $off_o = (-1)*$offf;
+										my $t2_remain = substr $seq2, $offf, $off_o;		# fectch the base from $seq2(the last 3-multi bases);
+										my $t2_remain_r = reverse $t2_remain;
+										$t2_remain_r =~ tr/ACGTacgt/TGCAtgca/;
+
+										my $r_l = length($seq2) - $off_o;
+										$in_frame_2 = substr $seq2, 0, $r_l;	# the the reminaing in frame seq of seq2;
+
+										$new_na = $leftover_1.$t2_remain_r;	# old is the seq2 before fusion
+										$old_na = $t2_remain.$track_back_2;	# the new is the fused
+										$old_na_r = reverse $old_na;
+										$old_na_r =~ tr/ACGTacgt/TGCAtgca/;
+
+										$old_aa = $codon_aa{$old_na_r};
+										$new_aa = $codon_aa{$new_na};
+										if(($new_na ne $old_na_r) || ($new_aa ne $old_aa))	{	$mutation++;	}
+
+							#			print "$fusion: $g2: $multi1: $multi2: $leftover_1:$track_back_2:$t2_remain_r:$old_na->$new_na($old_aa->$new_aa)\n$seq2_r\n$in_frame_2_r\n";
+									}
+
+									# translation of the fusion transcript
+									my $prot1 = translation ($seq1);
+									my $prot2;
+									my $prot2_mut;
+									my $seq2_r = reverse $seq2;
+									$seq2_r =~ tr/ACGTacgt/TGCAtgca/;
+
+									if ($in_frame_2)
+									{
+										my $in_frame_2_r = reverse $in_frame_2;
+										$in_frame_2_r =~ tr/ACGTacgt/TGCAtgca/;
+										$prot2_mut = translation($in_frame_2_r);
+									}
+								#	else
+								#	{
+										my $new_seq2 = $leftover_1.$seq2_r;
+										$prot2 = translation($new_seq2);
+								#	}
+
+						#			print "$fusion: $g2: Frame: $multi1:$multi2: Start: $index_cds2\tBoundary: $index_b_e2($junction_exon2)\tStop:$index_cds_end2\n$prot1\n$new_aa\n$prot2\n";
+
+						#			my $pause = <STDIN>;
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+
+									if($mutation)
+									{
+										print PROTEIN "$fusion\tcoding to coding fusion \t$acc\t$in_frame\t$old_na_r->$new_na($old_aa->$new_aa)\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2_r\t$prot1##$new_aa##$prot2_mut\n";
+									}
+									else
+									{
+										print PROTEIN "$fusion\tcoding to coding fusion \t$acc\t$in_frame\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2_r\t$prot1##$prot2\n";
+									}
+								}
+
+
+								elsif($cds_start2 <= $boundary2)
+								# if the coding starts after the fusion boundary,
+								{
+									my $non_coding_2;
+									my $coding;
+
+									my $temp_string;
+									for(my $a=$index_b_e2; $a>=$index_cds2; $a--)
+									{
+										if($temp_string)
+										{
+											$temp_string = $exon_seq{$exon2[$a]}.$temp_string;
+										}
+										else
+										{
+											$temp_string = $exon_seq{$exon2[$a]};
+										}
+									}
+
+									if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+									{
+										my $s1 = $1;
+										my $temp = $cds_start2 - $s1;
+										my $ll = length($temp_string);
+										$coding = substr $temp_string, 0, $temp;
+										my $non_coding_temp = substr $temp_string, $temp; 	# get rid of the first $temp charater
+
+										if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+										{
+											my $temp1 = $2-$1-$ex_b2;
+											$non_coding_2 = substr $non_coding_temp, 0, ($ll - $temp1 - $temp);
+										}
+									}
+
+									my $new_start = $index_cds2 - 1;
+									for(my $a=$new_start; $a>=0; $a--)
+									{
+										if($coding)	{	$coding = $exon_seq{$exon2[$a]}.$coding;	}
+										else {	$coding = $exon_seq{$exon2[$a]};	}
+									}
+
+									# translation of the fusion transcript
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+
+									my $prot1 = translation ($seq1);
+									my $coding_r = reverse $coding;
+									$coding_r =~ tr/ACGTacgt/TGCAtgca/;
+									my $prot2 = translation ($coding_r);
+
+									my $non_coding_2_r = reverse $non_coding_2;
+									$non_coding_2_r =~ tr/ACGTacgt/TGCAtgca/;
+									my $combined = $leftover_1.$non_coding_2_r;
+
+									my $multi_non_coding = (length ($combined)) % 3;
+									my $insert;
+
+									if ($multi_non_coding == 0)
+									{
+										my $insert2 = translation($combined);
+										if($insert2 !~ m/\*/)
+										{	$in_frame = 'YES';	}
+										print PROTEIN "$fusion\tcoding region of $g1 fused in front of the 5' UTR of $g2 \t$acc\t$in_frame\tINSERTION:$combined($insert2)\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$non_coding_2_r$coding_r\t$prot1##$insert2##$prot2\n";
+									}
+									else
+									{
+										my $seq_all = $leftover_1.$non_coding_2_r.$coding_r;
+										my $prot2_out =  translation($seq_all);
+										print PROTEIN "$fusion\tcoding region of $g1 fused in front of the 5' UTR of $g2 \t$acc\t$in_frame\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$non_coding_2_r$coding_r\t$prot1##$prot2_out\n";
+									}
+								}
+
+								elsif($boundary2 <= ($cds_end2-2))
+								# fusion happens after stop codon
+								{
+									for(my $a=$index_b_e2; $a>=0; $a--)
+									{
+										if($seq2)	{	$seq2 = $exon_seq{$exon2[$a]}.$seq2;	}
+										else {		$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+									if($exon2[$index_b_e2] =~ m/:(.+)-(.+)$/)
+									{
+										my $ll = length ($seq2);
+										my $till = $ll - ($2 - $1 - $ex_b2);
+										if ($till != 0)	{	$seq2 = substr $seq2, 0, $till;	}
+									}
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+
+									my $prot1 = translation ($seq1);
+
+									my $seq2_r = reverse $seq2;
+									$seq2_r =~ tr/ACGTacgt/TGCAtgca/;
+									my $combined = $leftover_1.$seq2_r;
+									my $prot2 = translation ($combined);
+									print PROTEIN "$fusion\tCoding region of $g1 fused to 3' UTR of $g2 \t$acc\t$in_frame (part of $g1)\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\t$prot1##$prot2\n";
+								}
+							}
+						}
+
+						elsif($cds_start1 > $boundary1)
+						# if the coding of transcript1 starts after the fusion bounday (NOTE: ALL Coding Regions of T1 are fused out)
+						{
+
+							for(my $b= 0; $b<$index_b_e1; $b++)
+							{
+								if($seq1)	{	$seq1 = $seq1.$exon_seq{$exon1[$b]};	}
+								else {		$seq1 = $exon_seq{$exon1[$b]};	}
+							}
+
+							my $temp_be_seq = $exon_seq{$exon1[$index_b_e1]};
+							if($ex_b1 != 1)
+							{	$temp_be_seq = substr ($temp_be_seq, 0, $ex_b1);	}	# get rid of the seq after the junction points
+							if($seq1)	{	$seq1 = $seq1.$temp_be_seq;	}
+							else	{	$seq1 = $temp_be_seq;	}
+
+							# Seq1 is the 5' UTR of gene 1;
+							##########################################################
+							# now process the 2nd gene transcripts
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+
+								# NOTE: for a reverse gene, cds_start is the end, and cds_end is the start; # NOTE NOTE NOTE verified with the refFlat file
+								my $cds_start2 = $transcript_cds_end{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_start{$transcripts2[$m]};
+
+								my $seq2;		# the coding region of transcript2 that are fused in;
+								my $fused_out2;		# the coding region of transcript2 that are fused out
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+								my $multi2;
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								my $boundary2;
+
+								my $in_frame;
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))	{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))	{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+											$boundary2 = $start + $ex_b2;		# the actual boundary
+										}
+									}
+								}
+
+								if(($cds_start2 > $boundary2) && ($boundary2 >= ($cds_end2-2)))	# NOTE: CDS start and end positions are already in reverse order
+								# if the coding starts in the exon before the fusion bounday exon, AND, fusion happens before the stop codon;
+								{
+									$seq2 = $exon_seq{$exon2[$index_b_e2]};
+									$seq2 = substr $seq2, 0, $ex_b2;				# get the string in front of $ex_b2 as the fused in
+
+									### get the coding regions that are fused in ($seq2)
+									for(my $a=($index_b_e2-1); $a>=0; $a--)
+									{
+										if($seq2)	{	$seq2 = $exon_seq{$exon2[$a]}.$seq2;	}
+										else	{	$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+
+									# translation of the fusion transcript
+									my $seq2_r = reverse $seq2;
+									$seq2_r =~ tr/ACGTacgt/TGCAtgca/;
+									my $seq = $seq1.$seq2_r;
+									my $prot = translation ($seq);
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+
+									print PROTEIN "$fusion\t5'UTR of $g1 fused into the coding region of $g2\t$acc\tNOT_Evaluated\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2_r\t...$prot\n";
+								}
+
+								elsif($cds_start2 <= $boundary2)
+								# if the coding starts after the fusion boundary, and by default fusion happens before stop codon
+								{
+									my $non_coding_2;		#sequence from the boundary till the ATG
+									my $coding;
+
+									my $temp_string;
+									for(my $a=$index_b_e2; $a>=$index_cds2; $a--)
+									{
+										if($temp_string)
+										{	$temp_string = $exon_seq{$exon2[$a]}.$temp_string;	}
+										else	{	$temp_string = $exon_seq{$exon2[$a]};	}
+									}
+
+									if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+									{
+										my $s1 = $1;
+										my $temp = $cds_start2 - $s1;
+										my $ll = length($temp_string);
+										$coding = substr $temp_string, 0, $temp;
+										my $non_coding_temp = substr $temp_string, $temp; 	# get rid of the first $temp charater
+
+										if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+										{
+											my $temp1 = $2-$1-$ex_b2;
+											$non_coding_2 = substr $non_coding_temp, 0, ($ll - $temp1 - $temp);
+										}
+									}
+
+									my $new_start = $index_cds2 - 1;
+									for(my $a=$new_start; $a>=0; $a--)
+									{
+										if($coding)	{	$coding = $exon_seq{$exon2[$a]}.$coding;	}
+										else {	$coding = $exon_seq{$exon2[$a]};	}
+									}
+
+									# translation of the fusion transcript
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+
+									my $coding_r = reverse $coding;
+									$coding_r =~ tr/ACGTacgt/TGCAtgca/;
+
+									my $non_coding_2_r = reverse $non_coding_2;
+									$non_coding_2_r =~ tr/ACGTacgt/TGCAtgca/;
+
+									my $prot = translation($coding_r);
+									{	print PROTEIN "$fusion\t5'UTR of $g1 fused into the 5' UTR of $g2 \t$acc\tYES($g2)\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$non_coding_2_r$coding_r\t##$prot\n";
+									}
+								}
+
+								elsif($boundary2 < ($cds_end2-2))
+								# fusion happens after stop codon
+								{
+									for(my $a=$index_b_e2; $a>=0; $a--)
+									{
+										if($seq2)	{	$seq2 = $exon_seq{$exon2[$a]}.$seq2;	}
+										else {		$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+									if($exon2[$index_b_e2] =~ m/:(.+)-(.+)$/)
+									{
+										my $ll = length ($seq2);
+										my $till = $ll - ($2 - $1 - $ex_b2);
+										if ($till != 0)	{	$seq2 = substr $seq2, 0, $till;	}
+									}
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+
+									my $seq2_r = reverse $seq2;
+									$seq2_r =~ tr/ACGTacgt/TGCAtgca/;
+
+									print PROTEIN "$fusion\t5'UTR of $g1 fused into the 3' UTR of $g2\t$acc\tNOT_Evaluated\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2_r\tNOT_Calculated\n";
+								}
+							}
+						}
+
+						elsif($boundary1 >= ($cds_end1+2))
+						# if fusion happens after the stop codon NOTE: ALL Coding Regions of T1 are fused in) and the stop codon of gene1 stops anything from happening to gene 2
+						{
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+								my $cds_start2 = $transcript_cds_end{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_start{$transcripts2[$m]};
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))
+										{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))
+										{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+										}
+									}
+								}
+								my $e2c = $index_b_e2+1;
+								my $e1c = $index_b_e1+1;
+								$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+
+								print PROTEIN "$fusion\t3'UTR of $g1 fused into $g2, No $g2 in the fused protein\t$acc\tYES($g1)\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t\tthe entire $g1 protein from $transcripts1[$k]\n";
+							}
+						}
+					}
+				}
+
+
+				#####################################################################################################
+				#####################################################################################################
+				if(($dir1 eq '-') && ($dir2 eq '-'))		# Reverse and Reverse
+				{
+					for(my $k=0; $k<$count_t1; $k++)		# for each transcript of gene1
+					{
+						my @exon1 = split(/#/, $transcript_exons{$transcripts1[$k]});
+						my $ec1 = scalar(@exon1);
+						my $cds_start1 = $transcript_cds_end{$transcripts1[$k]};
+						my $cds_end1 = $transcript_cds_start{$transcripts1[$k]};
+						my $seq1;		# the coding region of transcript1
+						my $boundary1;
+
+						my $multi1;
+
+						my $index_cds1;	# the exon index of where the start codon belongs to
+						my $index_cds_end1;	# the exon index of where the end codon belongs to
+						my $index_b_e1;	# the exon index of the boundary exon
+						for(my $l=0; $l<$ec1; $l++)		# go through all exons of the first transcript
+						{
+							if($exon1[$l] =~ m/:(.+)-(.+)$/)
+							{
+								my $start = $1;
+								my $end = $2;
+								# found the exon with the start cds
+								if(($end >= $cds_start1) && ($start <= $cds_start1))	{	$index_cds1 = $l;	}
+								# found the exon with the end cds
+								if(($end >= $cds_end1) && ($start <= $cds_end1))	{	$index_cds_end1 = $l;	}
+								# found the boundary exon
+								if($exon1[$l] eq $junction_exon1)
+								{
+									$index_b_e1 = $l;
+									$boundary1 = $start +  $ex_b1;		# the actual boundary
+								}
+							}
+						}
+						### ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ###
+						if(($cds_start1 > $boundary1) && ($boundary1 > ($cds_end1 - 2)))		# NOTE: new
+						# if the coding of transcript1 starts before the fusion bounday, AND, fusion happens before the stop codon;
+						{
+							if($exon1[$index_cds1] =~ m/:(.+)-(.+)$/)
+							{
+								my $start = $2;
+								my $end = $1;
+								my $off = $cds_start1 - $end;					# 0-based start; 1-based end
+
+								$seq1 = substr $exon_seq{$exon1[$index_cds1]}, 0, $off;	 # take off the bases before ATG
+
+							}
+							my $new_start1 = $index_cds1 - 1;	# starting the next exon, if any, till the boundary exon
+							for(my $l=$new_start1; $l>=$index_b_e1; $l--)
+							{
+								$seq1 = $exon_seq{$exon1[$l]}.$seq1;
+							}
+							$seq1 = substr $seq1, ($ex_b1-1);		# Take off the string in front of $ex_b2, not including the $ex_b2 base
+
+							my $distance1 = length ($seq1);
+							$multi1 = $distance1 % 3;
+							my $seq1_r = reverse $seq1;
+							$seq1_r =~ tr/ACGTacgt/TGCAtgca/;
+							$seq1 = $seq1_r;
+
+							my $leftover_1;	# the last $multi1 bases from Seq1;
+							my $offset_temp = (-1)* $multi1;
+							$leftover_1 = substr $seq1, $offset_temp, $multi1; 	# the last $multi1 bases from Seq1; because it's already reverse complementary
+
+							##########################################################
+							# now process the 2nd gene transcripts
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+
+								# NOTE: for a reverse gene, cds_start is the end, and cds_end is the start; # NOTE NOTE NOTE verified with the refFlat file
+								my $cds_start2 = $transcript_cds_end{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_start{$transcripts2[$m]};
+
+								my $seq2;		# the coding region of transcript2 that are fused in;
+								my $fused_out2;		# the coding region of transcript2 that are fused out
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+								my $multi2;
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								my $boundary2;
+
+								my $in_frame;
+
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))	{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))	{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+											$boundary2 = $start + $ex_b2;		# the actual boundary
+										}
+									}
+								}
+							#	print "$fusion: LeftOver Gene1: $leftover_1\nCDS Starts: $cds_start1 - $cds_start2: Boundary: $boundary1: $boundary2\n";
+
+								if(($cds_start2 > $boundary2) && ($boundary2 > ($cds_end2-2)))	# NOTE: CDS start and end positions are already in reverse order
+								# if the coding starts in the exon before the fusion bounday exon, AND, fusion happens before the stop codon;
+								{
+									# need to calculate how much of the coding region were fused out
+									if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $2;
+										my $end = $1;
+										my $off =  $cds_start2 - $end;
+										$fused_out2 = substr $exon_seq{$exon2[$index_cds2]}, 0, $off;
+										# keep ATG to end; still in reverse direction NOTE: the case of $off == 0; is validated
+									}
+
+									my $new_start2 = $index_cds2 - 1;	# starting the exon before, if any, till BEFORE the boundary exon
+									for(my $a=$new_start2; $a>=$index_b_e2; $a--)
+									{
+										$fused_out2 = $exon_seq{$exon2[$a]}.$fused_out2;
+									}
+									$seq2 = $fused_out2;
+									$seq2 = substr $seq2, 0, $ex_b2;			# get the string in front of $ex_b2 as the fused in
+
+									$fused_out2 = substr $fused_out2, $ex_b2;		# Take off the string in front of $ex_b2, not including the $ex_b2 base
+									my $distance2 = length($fused_out2);
+									$multi2 = $distance2 % 3;
+
+									### get the rest of the coding coding regions that are fused in ($seq2)
+									for(my $a=($index_b_e2-1); $a>=0; $a--)
+									{
+										if($seq2)	{	$seq2 = $exon_seq{$exon2[$a]}.$seq2;	}
+										else	{	$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+
+									my $mutation;
+									my $in_frame_2;	# trimmed Seq2 from the begining, so Seq2 is in frame
+									my $old_na;
+									my $new_na;
+									my $old_na_r;
+									my $old_aa;
+									my $new_aa;
+									if(($multi2 == 0) && ($multi1 == 0))	{	$in_frame = 'YES';	}
+									elsif($multi1 == $multi2)
+									{
+										$in_frame = 'YES';
+										my $track_back_2 = substr $fused_out2, 0, $multi2;	# the first $mult2 bases from fused out2
+										my $offf = (-1)*(3 - $multi2);
+										my $off_o = (-1)*$offf;
+										my $t2_remain = substr $seq2, $offf, $off_o;		# fectch the base from $seq2(the last 3-multi bases);
+										my $t2_remain_r = reverse $t2_remain;
+										$t2_remain_r =~ tr/ACGTacgt/TGCAtgca/;
+
+										my $r_l = length($seq2) - $off_o;
+										$in_frame_2 = substr $seq2, 0, $r_l;	# the the reminaing in frame seq of seq2;
+
+										$new_na = $leftover_1.$t2_remain_r;	# old is the seq2 before fusion
+										$old_na = $t2_remain.$track_back_2;	# the new is the fused
+										$old_na_r = reverse $old_na;
+										$old_na_r =~ tr/ACGTacgt/TGCAtgca/;
+
+										$old_aa = $codon_aa{$old_na_r};
+										$new_aa = $codon_aa{$new_na};
+										if(($new_na ne $old_na_r) || ($new_aa ne $old_aa))	{	$mutation++;	}
+
+									#	print "$fusion: $g2: $multi1: $multi2: $leftover_1:$track_back_2:$t2_remain_r:$old_na_r->$new_na($old_aa->$new_aa)\n$seq2_r\n$in_frame_2_r\n";
+									}
+
+									# translation of the fusion transcript
+									my $prot1 = translation ($seq1);
+									my $prot2;
+									my $prot2_mut;
+									my $seq2_r = reverse $seq2;
+									$seq2_r =~ tr/ACGTacgt/TGCAtgca/;
+
+									if ($in_frame_2)
+									{
+										my $in_frame_2_r = reverse $in_frame_2;
+										$in_frame_2_r =~ tr/ACGTacgt/TGCAtgca/;
+										$prot2_mut = translation($in_frame_2_r);
+									}
+								#	else
+								#	{
+									#	print "NOT in_frame_2\n";
+										my $new_seq2 = $leftover_1.$seq2_r;
+										$prot2 = translation($new_seq2);
+								#	}
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+									if($mutation)
+									{
+									#	print "Mutation!\n";
+										print PROTEIN "$fusion\tcoding to coding fusion \t$acc\t$in_frame\t$old_na_r->$new_na($old_aa->$new_aa)\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2_r\t$prot1##$new_aa##$prot2_mut\n";
+									}
+									else
+									{
+										print PROTEIN "$fusion\tcoding to coding fusion \t$acc\t$in_frame\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2_r\t$prot1##$prot2\n";
+									}
+								}
+
+
+								elsif($cds_start2 <= $boundary2)
+								# if the coding starts after the fusion boundary,
+								{
+									my $non_coding_2;
+									my $coding;
+
+									my $temp_string;
+									for(my $a=$index_b_e2; $a>=$index_cds2; $a--)
+									{
+										if($temp_string)
+										{
+											$temp_string = $exon_seq{$exon2[$a]}.$temp_string;
+										}
+										else
+										{
+											$temp_string = $exon_seq{$exon2[$a]};
+										}
+									}
+
+									if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+									{
+										my $s1 = $1;
+										my $temp = $cds_start2 - $s1;
+										my $ll = length($temp_string);
+										$coding = substr $temp_string, 0, $temp;
+										my $non_coding_temp = substr $temp_string, $temp; 	# get rid of the first $temp charater
+
+										if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+										{
+											my $temp1 = $2-$1-$ex_b2;
+											$non_coding_2 = substr $non_coding_temp, 0, ($ll - $temp1 - $temp);
+										}
+									}
+
+									my $new_start = $index_cds2 - 1;
+									for(my $a=$new_start; $a>=0; $a--)
+									{
+										if($coding)	{	$coding = $exon_seq{$exon2[$a]}.$coding;	}
+										else {	$coding = $exon_seq{$exon2[$a]};	}
+									}
+
+									# translation of the fusion transcript
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+									my $prot1 = translation ($seq1);
+									my $coding_r = reverse $coding;
+									$coding_r =~ tr/ACGTacgt/TGCAtgca/;
+									my $prot2 = translation ($coding_r);
+
+									my $non_coding_2_r = reverse $non_coding_2;
+									$non_coding_2_r =~ tr/ACGTacgt/TGCAtgca/;
+									my $combined = $leftover_1.$non_coding_2_r;
+
+									my $multi_non_coding = (length ($combined)) % 3;
+									my $insert;
+
+									if ($multi_non_coding == 0)
+									{
+										my $insert2 = translation($combined);
+										if($insert2 !~ m/\*/)
+										{	$in_frame = 'YES';	}
+										print PROTEIN "$fusion\tcoding region of $g1 fused in front of the 5' UTR of $g2 \t$acc\t$in_frame\tINSERTION:$combined($insert2)\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$non_coding_2_r$coding_r\t$prot1##$insert2##$prot2\n";
+									}
+									else
+									{
+										my $seq_all = $leftover_1.$non_coding_2_r.$coding_r;
+										my $prot2_out =  translation($seq_all);
+										print PROTEIN "$fusion\tcoding region of $g1 fused in front of the 5' UTR of $g2 \t$acc\t$in_frame\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$non_coding_2_r$coding_r\t$prot1##$prot2_out\n";
+									}
+								}
+
+								elsif($boundary2 <= ($cds_end2-2))
+								# fusion happens after stop codon
+								{
+									for(my $a=$index_b_e2; $a>=0; $a--)
+									{
+										if($seq2)	{	$seq2 = $exon_seq{$exon2[$a]}.$seq2;	}
+										else {		$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+									if($exon2[$index_b_e2] =~ m/:(.+)-(.+)$/)
+									{
+										my $ll = length ($seq2);
+										my $till = $ll - ($2 - $1 - $ex_b2);
+										if ($till != 0)	{	$seq2 = substr $seq2, 0, $till;	}
+									}
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+									my $prot1 = translation ($seq1);
+
+									my $seq2_r = reverse $seq2;
+									$seq2_r =~ tr/ACGTacgt/TGCAtgca/;
+									my $combined = $leftover_1.$seq2_r;
+									my $prot2 = translation ($combined);
+									print PROTEIN "$fusion\tCoding region of $g1 fused to 3' UTR of $g2 \t$acc\t$in_frame (part of $g1)\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\t$prot1##$prot2\n";
+								}
+							}
+						}
+						elsif($cds_start1 <= $boundary1)
+						# if the coding of transcript1 starts after the fusion bounday (NOTE: ALL Coding Regions of T1 are fused out)
+						{
+							my $last_e1 = $ec1 - 1;
+							for(my $b=$last_e1; $b>=$index_b_e1; $b--)
+							{
+								if($seq1)	{	$seq1 = $exon_seq{$exon1[$b]}.$seq1;	}
+								else {		$seq1 = $exon_seq{$exon1[$b]};	}
+							}
+
+							$seq1 = substr $seq1, ($ex_b1-1);		# Take off the string in front of $ex_b2, not including the $ex_b2 base
+
+							my $distance1 = length ($seq1);
+							$multi1 = $distance1 % 3;
+							my $seq1_r = reverse $seq1;
+							$seq1_r =~ tr/ACGTacgt/TGCAtgca/;
+							$seq1 = $seq1_r;
+
+							##########################################################
+							# now process the 2nd gene transcripts
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+
+								# NOTE: for a reverse gene, cds_start is the end, and cds_end is the start; # NOTE NOTE NOTE verified with the refFlat file
+								my $cds_start2 = $transcript_cds_end{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_start{$transcripts2[$m]};
+
+								my $seq2;		# the coding region of transcript2 that are fused in;
+								my $fused_out2;		# the coding region of transcript2 that are fused out
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+								my $multi2;
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								my $boundary2;
+
+								my $in_frame;
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))	{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))	{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+											$boundary2 = $start + $ex_b2;		# the actual boundary
+										}
+									}
+								}
+
+								if(($cds_start2 > $boundary2) && ($boundary2 >= ($cds_end2-2)))	# NOTE: CDS start and end positions are already in reverse order
+								# if the coding starts in the exon before the fusion bounday exon, AND, fusion happens before the stop codon;
+								{
+									$seq2 = $exon_seq{$exon2[$index_b_e2]};
+									$seq2 = substr $seq2, 0, $ex_b2;				# get the string in front of $ex_b2 as the fused in
+
+									### get the coding regions that are fused in ($seq2)
+									for(my $a=($index_b_e2-1); $a>=0; $a--)
+									{
+										if($seq2)	{	$seq2 = $exon_seq{$exon2[$a]}.$seq2;	}
+										else	{	$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+
+									# translation of the fusion transcript
+									my $seq2_r = reverse $seq2;
+									$seq2_r =~ tr/ACGTacgt/TGCAtgca/;
+									my $seq = $seq1.$seq2_r;
+									my $prot = translation ($seq);
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+									print PROTEIN "$fusion\t5'UTR of $g1 fused into the coding region of $g2\t$acc\tNOT_Evaluated\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2_r\t...$prot\n";
+								#	print "-/-$fusion: $acc: $ec1-$ec2: $e1c - $e2c\n";
+								}
+
+								elsif($cds_start2 <= $boundary2)
+								# if the coding starts after the fusion boundary, and by default fusion happens before stop codon
+								{
+									my $non_coding_2;		#sequence from the boundary till the ATG
+									my $coding;
+
+									my $temp_string;
+									for(my $a=$index_b_e2; $a>=$index_cds2; $a--)
+									{
+										if($temp_string)
+										{	$temp_string = $exon_seq{$exon2[$a]}.$temp_string;	}
+										else	{	$temp_string = $exon_seq{$exon2[$a]};	}
+									}
+
+									if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+									{
+										my $s1 = $1;
+										my $temp = $cds_start2 - $s1;
+										my $ll = length($temp_string);
+										$coding = substr $temp_string, 0, $temp;
+										my $non_coding_temp = substr $temp_string, $temp; 	# get rid of the first $temp charater
+
+										if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+										{
+											my $temp1 = $2-$1-$ex_b2;
+											$non_coding_2 = substr $non_coding_temp, 0, ($ll - $temp1 - $temp);
+										}
+									}
+
+									my $new_start = $index_cds2 - 1;
+									for(my $a=$new_start; $a>=0; $a--)
+									{
+										if($coding)	{	$coding = $exon_seq{$exon2[$a]}.$coding;	}
+										else {	$coding = $exon_seq{$exon2[$a]};	}
+									}
+
+									# translation of the fusion transcript
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+									my $coding_r = reverse $coding;
+									$coding_r =~ tr/ACGTacgt/TGCAtgca/;
+
+									my $non_coding_2_r = reverse $non_coding_2;
+									$non_coding_2_r =~ tr/ACGTacgt/TGCAtgca/;
+
+									my $prot = translation($coding_r);
+									{	print PROTEIN "$fusion\t5'UTR of $g1 fused into the 5' UTR of $g2 \t$acc\tYES($g2)\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$non_coding_2_r$coding_r\t##$prot\n";
+									}
+								}
+
+								elsif($boundary2 < ($cds_end2-2))
+								# fusion happens after stop codon
+								{
+									for(my $a=$index_b_e2; $a>=0; $a--)
+									{
+										if($seq2)	{	$seq2 = $exon_seq{$exon2[$a]}.$seq2;	}
+										else {		$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+									if($exon2[$index_b_e2] =~ m/:(.+)-(.+)$/)
+									{
+										my $ll = length ($seq2);
+										my $till = $ll - ($2 - $1 - $ex_b2);
+										if ($till != 0)	{	$seq2 = substr $seq2, 0, $till;	}
+									}
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+									$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+
+									my $seq2_r = reverse $seq2;
+									$seq2_r =~ tr/ACGTacgt/TGCAtgca/;
+
+									print PROTEIN "$fusion\t5'UTR of $g1 fused into the 3' UTR of $g2\t$acc\tNOT_Evaluated\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2_r\tNOT_Calculated\n";
+								}
+							}
+						}
+
+
+						elsif($boundary1 <= ($cds_end1-2))
+						# if fusion happens after the stop codon NOTE: ALL Coding Regions of T1 are fused in); but because of the stop codon of gene1, nothing will be happening for gene2
+						{
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+								my $cds_start2 = $transcript_cds_end{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_start{$transcripts2[$m]};
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))
+										{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))
+										{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+										}
+									}
+								}
+								my $e2c = $index_b_e2+1;
+								my $e1c = $index_b_e1+1;
+								$e2c = $ec2 - $e2c + 1;	# should count the exons of gene 2 backwards.
+								$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+								print PROTEIN "$fusion\t3'UTR of $g1 fused into $g2, No $g2 in the fused protein\t$acc\tYES($g1)\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t\tthe entire $g1 protein from $transcripts1[$k]\n";
+							}
+						}
+					}
+				}
+
+				##################################################################################################
+				######################################################################################################
+				if(($dir1 eq '-') && ($dir2 eq '+'))		# reverse and forward
+				{
+					for(my $k=0; $k<$count_t1; $k++)		# for each transcript of gene1
+					{
+						my @exon1 = split(/#/, $transcript_exons{$transcripts1[$k]});
+						my $ec1 = scalar(@exon1);
+						my $cds_start1 = $transcript_cds_end{$transcripts1[$k]};
+						my $cds_end1 = $transcript_cds_start{$transcripts1[$k]};
+						my $seq1;		# the coding region of transcript1
+						my $boundary1;
+
+						my $multi1;
+
+						my $index_cds1;	# the exon index of where the start codon belongs to
+						my $index_cds_end1;	# the exon index of where the end codon belongs to
+						my $index_b_e1;	# the exon index of the boundary exon
+						for(my $l=0; $l<$ec1; $l++)		# go through all exons of the first transcript
+						{
+							if($exon1[$l] =~ m/:(.+)-(.+)$/)
+							{
+								my $start = $1;
+								my $end = $2;
+								# found the exon with the start cds
+								if(($end >= $cds_start1) && ($start <= $cds_start1))	{	$index_cds1 = $l;	}
+								# found the exon with the end cds
+								if(($end >= $cds_end1) && ($start <= $cds_end1))	{	$index_cds_end1 = $l;	}
+								# found the boundary exon
+								if($exon1[$l] eq $junction_exon1)
+								{
+									$index_b_e1 = $l;
+									$boundary1 = $start +  $ex_b1;		# the actual boundary
+								}
+							}
+						}
+						### ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ### &&& ### ###
+						if(($cds_start1 > $boundary1) && ($boundary1 > ($cds_end1 - 2)))		# NOTE: new
+						# if the coding of transcript1 starts before the fusion bounday, AND, fusion happens before the stop codon;
+						{
+							if($exon1[$index_cds1] =~ m/:(.+)-(.+)$/)
+							{
+								my $start = $2;
+								my $end = $1;
+								my $off = $cds_start1 - $end;					# 0-based start; 1-based end
+
+								$seq1 = substr $exon_seq{$exon1[$index_cds1]}, 0, $off;	 # take off the bases before ATG
+
+							}
+							my $new_start1 = $index_cds1 - 1;	# starting the next exon, if any, till the boundary exon
+							for(my $l=$new_start1; $l>=$index_b_e1; $l--)
+							{
+								$seq1 = $exon_seq{$exon1[$l]}.$seq1;
+							}
+							$seq1 = substr $seq1, ($ex_b1-1);		# Take off the string in front of $ex_b2, not including the $ex_b2 base
+
+							my $distance1 = length ($seq1);
+							$multi1 = $distance1 % 3;
+							my $seq1_r = reverse $seq1;
+							$seq1_r =~ tr/ACGTacgt/TGCAtgca/;
+							$seq1 = $seq1_r;
+
+							my $leftover_1;	# the last $multi1 bases from Seq1;
+							my $offset_temp = (-1)* $multi1;
+							$leftover_1 = substr $seq1, $offset_temp, $multi1; 	# the last $multi1 bases from Seq1; because it's already reverse complementary
+
+							##########################################################
+							# now process the 2nd gene transcripts
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+								my $cds_start2 = $transcript_cds_start{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_end{$transcripts2[$m]};
+								my $seq2;		# the coding region of transcript2 that are fused in;
+								my $fused_out2;		# the coding region of transcript2 that are fused out
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+								my $multi2;
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								my $boundary2;
+
+								my $in_frame;
+
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))	{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))	{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+											$boundary2= $start + $ex_b2;		# the actual boundary
+										}
+									}
+								}
+
+								if(($cds_start2 < $boundary2) && ($boundary2 < $cds_end2))
+								# if the coding starts in the exon before the fusion bounday exon, AND, fusion happens before the stop codon;
+								{
+									#need to calculate how much of the coding region were fused out
+									if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										my $off = $cds_start2 - $start;					# 0-based start; 1-based end
+										$fused_out2 = substr $exon_seq{$exon2[$index_cds2]}, $off;	# take off the bases before ATG
+									}
+									my $new_start2 = $index_cds2 + 1;	# starting the next exon, if any, till BEFORE the boundary exon
+									for(my $a=$new_start2; $a<=$index_b_e2; $a++)
+									{
+										$fused_out2 = $fused_out2.$exon_seq{$exon2[$a]};
+									}
+
+									if($exon2[$index_b_e2] =~ m/:(.+)-(.+)$/)		# take off the end
+									{
+										my $off = ($2 - $1 - ($ex_b2-1))*(-1);
+										if($off != 0)	{	$fused_out2 = substr $fused_out2, 0, $off;	}
+									}
+									### get the coding regions that are fused in ($seq2)
+									for(my $a=$index_b_e2; $a<=$ec2; $a++)
+									{
+										if($seq2)	{	$seq2 = $seq2.$exon_seq{$exon2[$a]};	}
+										else	{	$seq2 = $exon_seq{$exon2[$a]};	}
+
+									}
+
+									# need to get rid of the first part of the boundary exon
+									if($ex_b2 != 1)	{	$seq2 = substr $seq2, ($ex_b2-1);	}		# Take off the string in front of $ex_b2
+
+
+									my $distance2 = length($fused_out2);
+									$multi2 = $distance2 % 3;
+
+									my $mutation;
+									my $in_frame_2;	# trimmed Seq2 from the begining, so Seq2 is in frame
+									my $old_na;
+									my $new_na;
+									my $old_aa;
+									my $new_aa;
+									if(($multi2 == 0) && ($multi1 == 0))	{	$in_frame = 'YES';	}
+									elsif($multi1 == $multi2)
+									{
+										$in_frame = 'YES';
+										my $offf = (-1)*$multi2;
+										my $track_back_2 = substr $fused_out2, $offf, $multi2;	# the last $mult2 bases from fused out2
+										$offf = 3 - $multi2;
+										my $t2_remain = substr $seq2, 0, $offf;		# fectch the base from $seq2;
+
+										$in_frame_2 = substr $seq2, $offf;	# the the reminaing in frame seq of seq2;
+										$new_na = $leftover_1.$t2_remain;	# new is the fused product
+										$old_na = $track_back_2.$t2_remain;	# old is the Seq2
+										$old_aa = $codon_aa{$old_na};
+										$new_aa = $codon_aa{$new_na};
+										if(($new_na ne $old_na) || ($new_aa ne $old_aa))	{	$mutation++;	}
+									}
+
+									# translation of the fusion transcript
+									my $prot1 = translation ($seq1);	# if there is leftover, it won't be used
+									my $prot2;
+									my $prot2_mut;
+									if ($in_frame_2)	{	$prot2_mut = translation($in_frame_2);	}
+								#	else
+								#	{
+										my $new_seq2 = $leftover_1.$seq2;
+										$prot2 = translation($new_seq2);
+								#	}
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+									if($mutation)
+									{
+										print PROTEIN "$fusion\tcoding to coding fusion\t$acc\t$in_frame\t$old_na->$new_na($old_aa->$new_aa)\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\t$prot1##$new_aa##$prot2_mut\n";
+									}
+									else
+									{
+										print PROTEIN "$fusion\tcoding to coding fusion\t$acc\t$in_frame\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\t$prot1##$prot2\n";
+									}
+								}
+
+								elsif($cds_start2 >= $boundary2)
+								# if the coding starts after the fusion boundary
+								{
+									my $non_coding_2;		#sequence from the boundary till the ATG
+									my $coding;
+									for(my $a=$index_b_e2; $a<=$index_cds2; $a++)
+									{
+										if($non_coding_2)
+										{
+											$non_coding_2 = $non_coding_2.$exon_seq{$exon2[$a]};
+										}
+										else
+										{
+											$non_coding_2 = $exon_seq{$exon2[$a]};
+										}
+									}
+
+									$coding = $exon_seq{$exon2[$index_cds2]};	# entire exon seq
+									if($ex_b2 != 1)	{	$non_coding_2 = substr $non_coding_2, ($ex_b2-1);	}# take off bases before the fusion junction,
+
+
+									if($exon2[$index_cds2] =~ m/:(.+)-(.+)$/)
+									{
+										my $off = (-1)*($2-$cds_start2+1);	# "+1" is to include the starting base of the Start Codon
+										if($off != 0)
+										{	$non_coding_2 = substr $non_coding_2, 0, $off;	}	# take off end: from cds start to the end
+
+										my $rel = $cds_start2 - $1 - 1;
+										$coding = substr $coding, $rel;		# take of the base before starting codon
+									}
+
+
+									my $new_start = $index_cds2 + 1;
+									for(my $a=$new_start; $a<$ec2; $a++)
+									{
+										$coding = $coding.$exon_seq{$exon2[$a]};
+									}
+								#	print "Noncoding: $non_coding_2\n\nCoding: $coding\n";
+								#	my $pause = <STDIN>;
+									# translation of the fusion transcript
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+									my $prot1 = translation ($seq1);
+									my $prot2 = translation ($coding);
+									my $combined = $leftover_1.$non_coding_2;
+									my $multi_non_coding = (length ($combined)) % 3;
+									my $insert;
+
+									if ($multi_non_coding == 0)
+									{
+										my $insert2 = translation($combined);
+										if($insert2 !~ m/\*/)
+										{	$in_frame = 'YES';	}
+										print PROTEIN "$fusion\tCoding of $g1 fused to 5' of $g2\t$acc\t$in_frame\tINSERTION:$combined($insert2)\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$non_coding_2$coding\t$prot1##$insert2##$prot2\n";
+									}
+									else
+									{
+										my $seq_all = $leftover_1.$non_coding_2.$coding;
+										my $prot2_out =  translation($seq_all);
+										print PROTEIN "$fusion\tCoding of $g1 fused to 5' of $g2\t$acc\t$in_frame\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$non_coding_2$coding\t$prot1##$prot2_out\n";
+									}
+								}
+
+								elsif($boundary2 >= $cds_end2)
+								# fusion happens after or at stop codon
+								{
+									for(my $a=$index_b_e2; $a<=$ec2; $a++)
+									{
+
+										if($seq2)	{	$seq2 = $seq2.$exon_seq{$exon2[$a]};	}
+										else {		$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+
+									if($ex_b2 != 1)	{	$seq2 = substr $seq2, ($ex_b2-1);	}		# Take off the string in front of $ex_b2
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+									my $prot1 = translation ($seq1);
+									my $combined = $leftover_1.$seq2;
+									my $prot2 = translation ($combined);
+									print PROTEIN "$fusion\tCoding of $g1 fused to the 3' UTR of $g2\t$acc\t$in_frame\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\t$prot1##$prot2\n";
+								}
+							}
+						}
+
+						elsif($cds_start1 <= $boundary1)
+						# if the coding of transcript1 starts after the fusion bounday (NOTE: ALL Coding Regions of T1 are fused out)
+						{
+							my $last_e1 = $ec1 - 1;
+							for(my $b=$last_e1; $b>=$index_b_e1; $b--)
+							{
+								if($seq1)	{	$seq1 = $exon_seq{$exon1[$b]}.$seq1;	}
+								else {		$seq1 = $exon_seq{$exon1[$b]};	}
+							}
+
+							$seq1 = substr $seq1, ($ex_b1-1);		# Take off the string in front of $ex_b2, not including the $ex_b2 base
+
+							my $distance1 = length ($seq1);
+							$multi1 = $distance1 % 3;
+							my $seq1_r = reverse $seq1;
+							$seq1_r =~ tr/ACGTacgt/TGCAtgca/;
+							$seq1 = $seq1_r;
+							##########################################################
+							# now process the 2nd gene transcripts
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+								my $cds_start2 = $transcript_cds_start{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_end{$transcripts2[$m]};
+								my $seq2;		# the coding region of transcript2 that are fused in;
+								my $fused_out2;		# the coding region of transcript2 that are fused out
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+
+								my $multi2;
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								my $boundary2;
+
+								my $in_frame;
+
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))	{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))	{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+											$boundary2= $start + $ex_b2;
+										}
+									}
+								}
+
+
+								if(($cds_start2 < $boundary2) && ($boundary2 < $cds_end2))
+								# if the coding starts before the fusion bounday, AND, fusion happens before the stop codon;
+								{
+									### get the coding regions that are fused in ($seq2)
+									for(my $a=$index_b_e2; $a<=$ec2; $a++)
+									{
+										if($seq2)	{	$seq2 = $seq2.$exon_seq{$exon2[$a]};	}
+										else	{	$seq2 = $exon_seq{$exon2[$a]};	}
+									}
+
+									# need to get rid of the first part of the boundary exon
+									$seq2 = substr $seq2, ($ex_b2-1);			# Take off the string in front of $ex_b2
+								#	print "$fusion: bOUNDARY: $ex_b2\nBoundary EXON: $seq2\n\n";
+
+									# translation of the fusion transcript
+									my $seq = $seq1.$seq2;
+									my $prot = translation ($seq);
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+									print PROTEIN "$fusion\t5'UTR of $g1 fused into the coding region of $g2\t$acc\tNOT_Evaluated\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\t...$prot\n";
+								}
+
+								elsif($cds_start2 >= $boundary2)
+								# if the coding starts after the fusion boundary, and by default fusion happens before stop codon
+								{
+									for(my $a=$index_b_e2; $a<$ec2; $a++)
+									{
+										if($seq2)
+										{
+											$seq2 = $seq2.$exon_seq{$exon2[$a]};
+										}
+										else
+										{
+											$seq2 = $exon_seq{$exon2[$a]};
+										}
+									}
+
+									$seq2 = substr $seq2, ($ex_b2-1);
+
+									# translation of the fusion transcript
+
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+									my $prot = translation($seq2);
+									{
+										print PROTEIN "$fusion\t5'UTR of $g1 fused into the 5' UTR of $g2 \t$acc\tYES\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t$seq1##$seq2\tAssuming: intact protein for $transcripts2[$m]\n";
+									}
+								}
+
+								elsif($boundary2 >= $index_cds_end2)
+								# fusion happens after stop codon
+								{
+									my $e2c = $index_b_e2+1;
+									my $e1c = $index_b_e1+1;
+									$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+									print PROTEIN "$fusion\t5'UTR of $g1 fused into the 3' UTR of $g2\t$acc\tNA\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t\t\n";
+								}
+							}
+
+						}
+
+
+						elsif($boundary1 <= ($cds_end1-2))
+						# if fusion happens after the stop codon NOTE: ALL Coding Regions of T1 are fused in); but because of the stop codon of gene1, nothing will be happening for gene2
+						{
+							for(my $m=0; $m<$count_t2; $m++)
+							{
+								my @exon2 = split(/#/, $transcript_exons{$transcripts2[$m]});
+								my $ec2 = scalar(@exon2);
+								my $cds_start2 = $transcript_cds_start{$transcripts2[$m]};
+								my $cds_end2 = $transcript_cds_end{$transcripts2[$m]};
+								my $acc = $transcripts1[$k].'->'.$transcripts2[$m];
+
+								my $index_cds2;	# the exon index of where the start codon belongs to
+								my $index_b_e2;	# the exon index of the boundary exon
+								my $index_cds_end2;	# the exon index of where the end codon belongs to
+								for(my $n=0; $n<$ec2; $n++)		# go through all exons of the 2ND transcript
+								{
+									if($exon2[$n] =~ m/:(.+)-(.+)$/)
+									{
+										my $start = $1;
+										my $end = $2;
+										# found the exon with the start cds
+										if(($end >= $cds_start2) && ($start <= $cds_start2))
+										{	$index_cds2 = $n;	}
+										# found the exon with the end cds
+										if(($end >= $cds_end2) && ($start <= $cds_end2))
+										{	$index_cds_end2 = $n;	}
+										# found the boundary exon
+										if($exon2[$n] eq $junction_exon2)
+										{
+											$index_b_e2 = $n;
+										}
+									}
+								}
+								my $e2c = $index_b_e2+1;
+								my $e1c = $index_b_e1+1;
+								$e1c = $ec1 - $e1c + 1;	# should count the exons of gene 1 backwards.
+
+								print PROTEIN "$fusion\t3'UTR of $g1 fused into $g2, No $g2 in the fused protein\t$acc\tYES($g1)\t\tE$e1c:$junction_exon1\tE$e2c:$junction_exon2\t\tthe entire $g1 protein from $transcripts1[$k]\n";
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+system("rm $config_hash{snowshoes_home}/error.log");
+system("rm $config_hash{snowshoes_home}/formatdb.log");
+#system ("rm $end/final_fusion_report.txt");
+
+close (FUSE);
+close(PROTEIN);
+close (OUT);
+close (LOG);
+close (PROBLEM);
+
+## NOTE need to look for the fusion nominees in all samples, even when the # of encompassing reads are below the threshold.
+## First, get the fusions reported;
+open (FINAL, "$end/final_fusion_report_interpreted.txt") or die "$!";
+my %reported_fusion_sample = ();	# KEY: sample###pair; VALUE: count
+my %reported_fusion = ();	# KEY: pair; VALUE: count
+#Sample\tFusion_pair_Alphabetical\tFUSION_GENE_directional\tType\tPotential_Fusion_Mechanism\tFusion_Strand\t$array_t[2]\t$array_t[3]\t$array_t[4]\t$array_t[5]\t$array_t[10]\t$array_t[8]\t$array_t[9]\t$array_t[12]\t$array_t[13]\t$array_t[14]\t$array_t[15]\t$array_t[17]\t$array_t[18]\t$array_t[19]\t$sample_title\tWARNING
+$in = <FINAL>;
+while ($in = <FINAL>)
+{
+	my @arr = split (/\t/, $in);
+	my $k = $arr[0].'###'.$arr[1];
+	$reported_fusion_sample{$k}++;
+	$reported_fusion{$arr[1]}++;
+}
+close (FINAL);
+
+my %fusion_sample_encompassing = ();	# key: sample###key, values:  counts of encompassing reads	# NOTE: for genome mapping pairs only.
+@files = plainfiles ($dir_candidates);
+
+foreach $file (@files)
+{
+	if ($file =~ m/\Q$dir_candidates\E\/(.+)_filtered_fusion_reads/)
+	# only genome
+	{
+		my $sample = $1;
+
+		open (READ, "$file") or die "$!";
+		#Read_ID End1_Chr End1_Position Strand_1 TYPE End2_Chr End2_Position Strand_2 Type Gene1 Gene2
+		$in = <READ>;		#title
+		while ($in = <READ>)
+		{
+			chomp $in;
+			my @arr = split (/\t/, $in);
+			my $pair;
+			if($arr[9] lt $arr[10])	{	$pair = $arr[9].'_'.$arr[10];	}
+			else	{	$pair = $arr[10].'_'.$arr[9];	}
+			my $sample_pair = $sample.'###'.$pair;
+			if((!($reported_fusion_sample{$sample_pair})) && ($reported_fusion{$pair}) )	# if fusion reported, but not in this sample
+			{
+				$fusion_sample_encompassing{$sample_pair}++;
+			}
+		}
+		close (READ);
+	}
+}
+open (OUT, ">$end/final_fusion_report_interpreted_new.txt") or die "$!";
+open (FINAL, "$end/final_fusion_report_interpreted.txt") or die "$!";
+$in = <FINAL>;
+print OUT $in;
+
+my @samples_all = keys (%sample_info);
+my %processed = ();
+while ($in = <FINAL>)
+{
+	print OUT $in;
+	my @arr = split (/\t/, $in);
+	if (!($processed{$arr[1]}))
+	{
+		foreach my $sample (@samples_all)
+		{
+			my $k = $sample.'###'.$arr[1];
+			if($fusion_sample_encompassing{$k})
+			{
+				print OUT "$sample\t$arr[1]\t\t\t\t\t$fusion_sample_encompassing{$k}\t\t\t\t\t\t\t\t\t\t\t\t\t\t$sample_info{$sample}\n";
+			}
+		}
+	}
+	$processed{$arr[1]}++;
+}
+close (FINAL);
+close (OUT);
+
+open (OLD, "$end/final_fusion_report_interpreted_new.txt") or die "$!";
+open (NEW, ">$end/temp.txt") or die "$!";
+
+$in = <OLD>;
+chomp $in;
+my @tit = split (/\t/, $in);
+# [0]-Sample	[1]-Fusion_pair_Alphabetical	[2]-FUSION_GENE_directional	[3]-Type	[4]-Potential_Fusion_Mechanism	[5]-Fusion_Strand	[6]-Total_pairs	[7]-Pairs(g2)	[8]-Pairs(j2)	[9]-Pairs(gj)	[10]-Mapping_Orientation_Encompassing_Reads_Genome	[11]-Genes_Mapping_Direction	[12]-Exon_Boundary_Fusion	[13]-Exon1	[14]-Exon2	[15]-#_Unique_Titling_Junction_Reads_in_ALL_SAMPLES	[16]-#_Titling_Junction_Reads_in_Current_Sample	[17]-PCR_Primer	[18]-Gene_Order_According_to_Primer	[19]-Mapping_Used_for_Primer	[20]-Sample ID	[21]-Lab ID	[22]-Description	[23]-WARNING
+
+print NEW "$tit[0]\t$tit[1]\t$tit[2]\t$tit[3]\t$tit[4]\t$tit[5]\tTotal_Encompassing_Read_Pairs\tTotal_Split_Reads\tDistance_If_Same_Chr\t$tit[12]\t$tit[13]\t$tit[14]\t$tit[17]\t$tit[18]\t$tit[20]\t$tit[21]\t$tit[22]\n";
+while ($in = <OLD>)
+{
+	chomp $in;
+	my @arr = split (/\t/, $in);
+	my $num = scalar(@arr);
+	print NEW "$arr[0]\t$arr[1]\t$arr[2]\t$arr[3]\t$arr[4]\t$arr[5]\t$arr[6]\t$arr[16]\t";
+	my @ex1 = split (/:/, $arr[13]);	# E15:chr16:ABCC1:NM_004996:16170182:16170258:+
+	my @ex2 = split (/:/, $arr[14]);
+
+	if($ex1[1] eq $ex2[1])
+	{
+		my $delta1 = abs($ex1[5] - $ex2[4]);
+		my $delta2 = abs($ex1[4] - $ex2[5]);
+		if($delta1 < $delta2)	{	print NEW "$delta1\t";	}
+		else	{	print NEW "$delta2\t";	}
+	}
+	else	{	print NEW "\t";	}
+
+	print NEW "$arr[12]\t$arr[13]\t$arr[14]\t$arr[17]\t$arr[18]\t$arr[20]\t$arr[21]\t$arr[22]";
+	for(my $k=23; $k<$num; $k++)
+	{	print NEW "\t$arr[$k]";	}
+	print NEW "\n";
+}
+close (OLD);
+close (NEW);
+
+
+system ("rm $end/final_fusion_report_interpreted.txt");
+system ("rm $end/fusion_summary_with_primer.txt");
+system ("rm $end/final_fusion_report.txt");
+system ("mv $end/temp.txt $end/final_fusion_report_RNA.txt");
+
+exit;
+
+#######################################################################################################
+sub translation
+{
+	my($na) = @_;
+	my $size = length($na);
+	$na =~ tr/agtc/AGTC/;
+	my @nas = split(//, $na);
+	my $protein;
+	for(my $c=0; $c<$size; )
+	{
+		my $code = $nas[$c].$nas[$c+1].$nas[$c+2];
+		my $aa = $codon_aa{$code};
+		if($protein)	{	$protein = $protein.$aa;	}
+		else	{	$protein = $aa;	}
+		if(!($aa))
+		{	last;	}
+
+		$c = $c + 3;
+	}
+	return $protein;
+}
+
+sub plainfiles
+{
+   my($dir_sub) = @_;
+   my $dh = DirHandle->new($dir_sub)   or die "can't opendir : $!";
+   return sort                     # sort pathnames
+          grep {    -f     }       # choose only "plain" files
+          map  { "$dir_sub/$_" }       # create full paths
+          grep {  !/^\./   }       # filter out dot files
+          $dh->read();             # read all entries
+}
+
+sub directories
+{
+   my($dir_sub) = @_;
+   my $dh = DirHandle->new($dir_sub)   or die "can't opendir @_: $!";
+   return sort                     # sort pathnames
+          grep {    -d     }       # choose only "plain" files
+          map  { "$dir_sub/$_" }       # create full paths
+          grep {  !/^\./   }       # filter out dot files
+          $dh->read();             # read all entries
+}
+
+sub check_config{
+	my $config = shift;
+
+	my @required = qw(minimal refdata distance max_fusion_isoform snowshoes_home read_length lib_size);
+
+	foreach (@required){
+		if (!defined $config->{$_}){
+			print STDERR "ERROR: Missing required config parameter $_\n";
+			exit(-1);
+		}
+	}
+}

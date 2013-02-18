@@ -14,7 +14,7 @@ else
 	-T VariantFiltration -V $out/$filename -o $out/$filename.tmp \
 	--filterExpression "QD < 2.0" --filterName QDFilter \
 	--filterExpression "HRun > 5" --filterName HRunFilter \
-	--filterExpression "FS > 20.0" --filterName FSFilter
+	--filterExpression "FS > 20" --filterName FSFilter
 
 	mv $out/$filename.tmp $out/$filename
 fi

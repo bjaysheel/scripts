@@ -3,7 +3,7 @@
 use strict;
 use warnings;
 
-my $out = "/data2/bsi/secondary/Beutler_Andreas_m068039/exome/120627_SN616_0194_AC0Y5DACXX_combine_run/numbers";
+my $out = "/data2/bsi/secondary/Beutler_Andreas_m068039/exome/120726_SN616_0199_BC117YACXX.combine-run/numbers";
 
 opendir (DIR, "$out") or die "Could not open dir\n";
 open (OUT, ">", "$out/all_coverage_data.tsv") or die "Could not create output file\n";

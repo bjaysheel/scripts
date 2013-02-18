@@ -1,0 +1,64 @@
+#!/usr/local/biotools/perl/5.10.0/bin/perl
+
+use warnings;
+use DirHandle;
+
+###################################NEW/0
+print "What is the project directory?\n";
+my $dir = <STDIN>;
+chomp $dir;
+
+system ("mkdir $dir/BWA_aln_Junction");
+system ("mkdir $dir/BWA_aln_Junction/sorted_sam");
+system ("mkdir $dir/BWA_aln_genome");
+system ("mkdir $dir/BWA_aln_genome/sorted_sam");
+system ("mkdir $dir/map");
+system ("mkdir $dir/fastq_temp");
+system ("mkdir $dir/fasta_fusion_one_end_mapped");
+system ("mkdir $dir/fusion_candidates");
+system ("mkdir $dir/results");
+system ("mkdir $dir/small_megablast_files");
+open (LOG, ">>$dir/log.txt") or die "$!";
+print LOG "###############################################\nCreate the following directories in the main folder:
+
+/BWA_aln_Junction
+/BWA_aln_Junction/sorted_sam
+/BWA_aln_Junction/sorted_sam/map
+/BWA_aln_genome
+/BWA_aln_genome/sorted_sam
+/BWA_aln_genome/sorted_sam/map
+/map
+/fastq_temp
+/fasta_fusion_one_end_mapped
+/fusion_candidates
+/results
+/small_megablast_files
+\n";
+
+
+close (LOG);
+exit;
+
+#######################################################################################################
+
+sub plainfiles
+{
+   my($dir_sub) = @_;
+   my $dh = DirHandle->new($dir_sub)   or die "can't opendir : $!";
+   return sort                     # sort pathnames
+          grep {    -f     }       # choose only "plain" files
+          map  { "$dir_sub/$_" }       # create full paths
+          grep {  !/^\./   }       # filter out dot files
+          $dh->read();             # read all entries
+}
+
+sub directories
+{
+   my($dir_sub) = @_;
+   my $dh = DirHandle->new($dir_sub)   or die "can't opendir @_: $!";
+   return sort                     # sort pathnames
+          grep {    -d     }       # choose only "plain" files
+          map  { "$dir_sub/$_" }       # create full paths
+          grep {  !/^\./   }       # filter out dot files
+          $dh->read();             # read all entries
+}

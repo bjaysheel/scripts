@@ -114,6 +114,7 @@ sub check_parameters {
 	unless($options{minMatch}) { $options{minMatch} = 4; }
 }
 
+#############################################################################
 sub check_sequence {
 	my $line = shift;
 
@@ -138,7 +139,6 @@ sub check_sequence {
 			}
 		}
 	}
-
 
 	if ($count >= $options{minMatch}){
 		#print current line if threshold meet and mark it.

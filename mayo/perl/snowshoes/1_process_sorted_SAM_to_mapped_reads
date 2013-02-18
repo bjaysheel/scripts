@@ -1,0 +1,280 @@
+#!/usr/local/biotools/perl/5.10.0/bin/perl
+
+use warnings;
+use DirHandle;
+use Data::Dumper;
+use File::Basename;
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### NOTE: get user input parameters
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+
+# NOTE the following file directories exist:
+#	$project/BWA_aln_Junction
+#	$project/BWA_aln_Junction/sorted_sam
+#	$project/BWA_aln_genome
+#	$project/BWA_aln_genome/sorted_sam
+#	$project/fastq_temp
+#	$project/fasta_fusion_one_end_mapped
+#	$project/fusion_candidates
+#	$project/map
+#	$project/results
+#print "What is the project directory?\n";
+#my $project = <STDIN>;
+my $project = $ARGV[0];
+chomp $project;
+open (LOG, ">>$project/log.txt") or die "$!";
+
+##################################################################################################
+my $out_genome = "$project/BWA_aln_genome";
+my $out_junction = "$project/BWA_aln_Junction";
+my $mapq_thres = 20;		# the threshold of MAPQ values for "good" alignment score.
+my $sam_j = "$out_junction/sorted_sam";
+my $sam_g = "$out_genome/sorted_sam";
+###################################################################################################
+
+print LOG "\n######################################################\nThe BWA alignment output from both Junction and Genome alignments are processed. The reads are written into three different categories with certain filtering criteria:\n1. Both reads are mapped with MAPQ > 20 for both ends\n2. Only one end mapped with MAPQ > 20, the other end is not mapped\n3. Both Ends were not mapped\n\n";
+
+################################################################
+
+my @files = plainfiles($sam_j);	# START with the junction reads
+my $file;
+my %processed_SAM = ();		# multiple lanes
+
+foreach $file (@files)
+{
+	# NOTE: before this program is done, the following steps have been taken:
+	#	1. samse output converted to BAM
+	#	2. BAM files are sorted using sequence IDs
+	#	3. sorted BAM files are converted to sorted SAM files
+	#	4. the FLAG fields are interpreted into strings from HEX values.
+	# NOTE: this program only process the sorted SAM files
+	# NOTE: it has been checked that all reads has only one mapped location.
+	if(!($processed_SAM{$file}))
+	{
+		if($file =~ m/\Q$sam_j\E\/(.+)_1_ID_sorted/)
+		{
+			my $base = $1;
+			my $j2_file = $sam_j."/".$base."_2_ID_sorted.sam";
+			my $g1_file = $sam_g."/".$base."_1_ID_sorted.sam";
+			my $g2_file = $sam_g."/".$base."_2_ID_sorted.sam";
+			print "\n$file\n$j2_file\n";
+			$processed_SAM{$file}++;
+			$processed_SAM{$j2_file}++;
+
+			my $mapped = $base."_samse_both_end_mapped.txt";
+			my $single = $base."_samse_one_end_mapped.txt";
+
+			# NOTE: filtering criteria:the default BWA aln -n was used: 4% total differences
+			#	1. MAPQ > 20;
+			open (BOTH, ">$project/map/$mapped") or die "$!";
+			print BOTH "Read_ID\tEnd1_ACC\tEnd1_Position\tStrand_1\tType\tEnd2_ACC\tEnd2_Position\tStrand_2\tType\n";
+			# wirte out to the output file only if:
+			#	both mapped with a good score (MAPQ >= 20 for both reads)
+
+			open (SIN, ">$project/map/$single") or die "$!";
+			print SIN "Read_ID\tEnd1_ACC\tEnd1_Position\tStrand_1\tType\tEnd2_ACC\tEnd2_Position\tStrand_2\tType\n";
+			# wirte out to the output file only if:
+			#	OR: one mapped with MAPQ >= 20, and the other not mapped
+
+			my $inj1;
+			my $inj2;
+			my $ing1;
+			my $ing2;
+			my $count = 0;
+
+			# NOTE: First, process Junction Alignment
+			open (SAMj1, "<", $file) or die "$!";
+			open (SAMj2, "<", $j2_file) or die "$!";
+			open (SAMg1, "<", $g1_file) or die "$!";
+			open (SAMg2, "<", $g2_file) or die "$!";
+
+			my $junc_both = 0;		# both ends mapped to junctions
+			my $junc1 = 0;		# 1st end mapped to junctions
+			my $junc2 = 0;		# 2nd end mapped to junctions
+			my $genome_both = 0;
+			my $genome1 = 0;
+			my $genome2 = 0;
+			my $junc_geno = 0;	# 1st end to junction, 2nd end to genome
+			my $geno_junc = 0;
+
+			# NOTE: filtering criteria:
+			while ((defined SAMj1 && defined SAMj2 && defined SAMg1 && defined SAMg2) &&
+				   ($inj1 = <SAMj1>) && ($inj2 = <SAMj2>) && ($ing1 = <SAMg1>) && ($ing2 = <SAMg2>))
+			{
+				# NOTE: when sorting the SAM/BAM files, no headers were written to the output files
+
+				# SAMSE OUTPUT FORMAT:
+				# 0 QNAME Query (pair) NAME
+				# 1 FLAG bitwise FLAG  NOTE: this has been converted to string using "samtools view -X"
+				# 2 RNAME Reference sequence NAME
+				# 3 POS 1-based leftmost POSition/coordinate of clipped sequence
+				# 4 MAPQ MAPping Quality (Phred-scaled) NOTE: MAPQ = 0, means matched to multiple locations
+				# 5 CIAGR extended CIGAR string
+				# 6 MRNM Mate Reference sequence NaMe (‘=’ if same as RNAME)
+				# 7 MPOS 1-based Mate POSistion
+				# 8 ISIZE Inferred insert SIZE
+				# 9 SEQ query SEQuence on the same strand as the reference
+				# 10 QUAL query QUALity (ASCII-33 gives the Phred base quality)
+				# 11 OPT variable OPTional fields in the format TAG:VTYPE:VALUE
+
+				my @array_j1 = split (/\t/, $inj1);
+				my @array_j2 = split (/\t/, $inj2);
+				my @array_g1 = split (/\t/, $ing1);
+				my @array_g2 = split (/\t/, $ing2);
+
+				my $id_j1 = $array_j1[0];
+				my $id_j2 = $array_j2[0];
+				my $id_g1 = $array_g1[0];
+				my $id_g2 = $array_g2[0];
+
+				my $flag_j1 = $array_j1[1];
+				my $flag_j2 = $array_j2[1];
+				my $flag_g1 = $array_g1[1];
+				my $flag_g2 = $array_g2[1];
+
+				$count++;
+				if ($id_j1 ne $id_j2)
+				{
+					print "THE SAM FILES ARE NOT SORTED THE SAME WAY, OR DIFFERENT NUMBER OF READS IN TWO FILES\n";
+					print "$id_j1\t$id_j2\t$id_g1\t$id_g2\n";
+					last;
+				}
+
+				else
+				{
+					# NOTE: it's checked. For samse output, the only possible FLAG values are:
+					# r: reverse
+					# u: unmapped
+					# NOTE: if the read is mapped but MAPQ = 0, it's mapped to multiple locations.
+
+					## if both end mapped to junctions NOTE: good mapQ doesn't garanttee 'mapped'
+					if(($array_j1[4] >= $mapq_thres) && ($array_j2[4] >= $mapq_thres) && ($flag_j1 !~ m/u/) && ($flag_j2 !~ m/u/))
+					{
+						$junc_both++;			# this has been recorded in the Junction both mapped file
+						print BOTH "$id_j1\t$array_j1[2]\t$array_j1[3]\t$flag_j1\tJUNCTION\t$array_j2[2]\t$array_j2[3]\t$flag_j2\tJUNCTION\n";
+						# Read_ID\tEnd1_ACC\tEnd1_Position\tStrand_1\tType\tEnd2_ACC\tEnd2_Position\tStrand_2\tType
+					}
+
+					# End 1 mapped to Junction;
+					elsif(($array_j1[4] >= $mapq_thres) && ($flag_j1 !~ m/u/))
+					{
+						if(($array_g2[4] >= $mapq_thres) && ($flag_g2 !~ m/u/))		# 2nd end mapped to genome. NOTE: since the 1st end was claimed by the Junc mapping, only care about the 2nd end
+						{
+							$junc_geno++;
+							print BOTH "$id_j1\t$array_j1[2]\t$array_j1[3]\t$flag_j1\tJUNCTION\t$array_g2[2]\t$array_g2[3]\t$flag_g2\tGENOME\n";
+						}
+						elsif (($flag_j2 =~ m/u/) && ($flag_g2 =~ m/u/))	# 2nd end not mapped; other senerios like a bad quality mapping will be filtered out
+						{
+							$junc1++;
+							print SIN "$id_j1\t$array_j1[2]\t$array_j1[3]\t$flag_j1\tJUNCTION\n";
+						}
+					}
+
+					# End 2 mapped to Junction;
+					elsif(($array_j2[4] >= $mapq_thres) && ($flag_j2 !~ m/u/))
+					{
+						if(($array_g1[4] >= $mapq_thres) && ($flag_g1 !~ m/u/))		# 1st end mapped to genome. NOTE: since the 2nd end was claimed by the Junc mapping, only care about the 1st end
+						{
+							$geno_junc++;
+							print BOTH "$id_g1\t$array_g1[2]\t$array_g1[3]\t$flag_g1\tGENOME\t$array_j2[2]\t$array_j2[3]\t$flag_j2\tJUNCTION\n";
+						}
+						elsif (($flag_j1 =~ m/u/) && ($flag_g1 =~ m/u/))	# 1st end not mapped; other senerios like a bad quality mapping will be filtered out
+						{
+							$junc2++;
+							print SIN "$id_j1\t\t\t\t\t$array_j2[2]\t$array_j2[3]\t$flag_j2\tJUNCTION\n";
+						}
+					}
+
+					## if both end mapped to genomes NOTE: good mapQ doesn't garanttee 'mapped'
+					elsif (($array_g1[4] >= $mapq_thres) && ($array_g2[4] >= $mapq_thres) && ($flag_g1 !~ m/u/) && ($flag_g2 !~ m/u/))
+					{
+						$genome_both++;			# this has been recorded in the Junction both mapped file
+						print BOTH "$id_g1\t$array_g1[2]\t$array_g1[3]\t$flag_g1\tGENOME\t$array_g2[2]\t$array_g2[3]\t$flag_g2\tGENOME\n";
+						# Read_ID\tEnd1_ACC\tEnd1_Position\tStrand_1\tType\tEnd2_ACC\tEnd2_Position\tStrand_2\tType
+					}
+
+					# End 1 mapped to genome, End 2 not mapped
+					elsif(($array_g1[4] >= $mapq_thres) && ($flag_g1 !~ m/u/))
+					{
+						if(($flag_j2 =~ m/u/) && ($flag_g2 =~ m/u/))	# 2nd end not mapped; other senerios like a bad quality mapping will be filtered out
+						{
+							$genome1++;
+							print SIN "$id_g1\t$array_g1[2]\t$array_g1[3]\t$flag_g1\tGENOME\n";
+						}
+					}
+
+					# End 2 mapped to genome, End 1 not mapped
+					elsif(($array_g2[4] >= $mapq_thres) && ($flag_g2 !~ m/u/))
+					{
+						if (($flag_j1 =~ m/u/) && ($flag_g1 =~ m/u/))	# 1st end not mapped; other senerios like a bad quality mapping will be filtered out
+						{
+							$genome2++;
+							print SIN "$id_g2\t\t\t\t\t$array_g2[2]\t$array_g2[3]\t$flag_g2\tGENOME\n";
+						}
+					}
+				}
+			}
+
+			print "Total alignment records in SAM file:\t$count\nBoth Matched to Junction:\t$junc_both\nBoth matched to Genome:\t$genome_both\n1st end mapped to genome, 2nd end mapped to junction:\t$geno_junc\n1st end mapped to junction, 2nd end mapped to genome\t$junc_geno\nOnly 1st end mapped to genome:\t$genome1\nOnly 2nd end mapped to genome:\t$genome2\nOnly 1st end mapped to junction:\t$junc1\nOnly 2st end mapped to junction:\t$junc2\n\n";
+			print LOG "$base\nTotal alignment records in SAM file:\t$count\nBoth Matched to Junction:\t$junc_both\nBoth matched to Genome:\t$genome_both\n1st end mapped to genome, 2nd end mapped to junction:\t$geno_junc\n1st end mapped to junction, 2nd end mapped to genome\t$junc_geno\nOnly 1st end mapped to genome:\t$genome1\nOnly 2nd end mapped to genome:\t$genome2\nOnly 1st end mapped to junction:\t$junc1\nOnly 2st end mapped to junction:\t$junc2\n\n";
+
+			close (SAMj1);
+			close (SAMj2);
+			close (SAMg1);
+			close (SAMg2);
+		}
+		close (BOTH);
+		close (SIN);
+	}
+}
+
+
+exit;
+
+#######################################################################################################
+#sub translation
+#{
+#	my($na) = @_;
+#	my $size = length($na);
+#	my @nas = split(//, $na);
+#	my $protein;
+#	for(my $c=0; $c<$size; )
+#	{
+#		my $code = $nas[$c].$nas[$c+1].$nas[$c+2];
+#		my $aa = $codon_aa{$code};
+#		if($protein)	{	$protein = $protein.$aa;	}
+#		else	{	$protein = $aa;	}
+#		if(!($aa))
+#		{	last;	}
+#
+#		$c = $c + 3;
+#	}
+#	return $protein;
+#}
+
+sub plainfiles
+{
+	my($dir_sub) = @_;
+	opendir (DIR, $dir_sub) or die "can't opendir : $!";
+	my @files = ();
+	while (my $file = readdir(DIR)){
+		next if ($file =~ /^\.+/);
+
+		push(@files, ($dir_sub."/".$file));
+
+	}
+	@files = sort(@files);
+	return @files;
+}
+
+#sub directories
+#{
+#   my($dir_sub) = @_;
+#   my $dh = DirHandle->new($dir_sub)   or die "can't opendir @_: $!";
+#   return sort                     # sort pathnames
+#          grep {    -d     }       # choose only "plain" files
+#          map  { "$dir_sub/$_" }       # create full paths
+#          grep {  !/^\./   }       # filter out dot files
+#          $dh->read();             # read all entries
+#}

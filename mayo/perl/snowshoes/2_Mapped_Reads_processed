@@ -1,0 +1,1599 @@
+#!/usr/local/biotools/perl/5.10.0/bin/perl
+
+use strict;
+use warnings;
+use DirHandle;
+use Data::Dumper;
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### NOTE: get user input parameters
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+
+# NOTE the following file directories exist:
+#	$project/BWA_aln_Junction
+#	$project/BWA_aln_Junction/sorted_sam
+#	$project/BWA_aln_genome
+#	$project/BWA_aln_genome/sorted_sam
+#	$project/fastq_temp
+#	$project/fasta_fusion_one_end_mapped
+#	$project/fusion_candidates
+#	$project/map
+#	$project/results
+#print "What is the project directory?\n";
+#my $project = <STDIN>;
+my $project = $ARGV[0];
+chomp $project;
+open (LOG, ">>$project/log.txt") or die "$!";
+
+## parse config file of the format
+## #comments
+## key=value
+
+system ("dos2unix $project/config_info.txt");
+open (CON, "<", $project."/config_info.txt") or die "the file configure.txt could not be found, $!";
+my %config_hash;
+while (<CON>){
+	chomp $_;
+	next if ($_ =~ /^#/);
+
+	map { $config_hash{$1} = $2 if( /([^=]+)\s*=\s*([^=]+)/ ) } $_;
+}
+close(CON);
+
+check_config(\%config_hash);
+
+print "\n\nProject Folder: $project\nPerl Script Folder: $config_hash{snowshoes_home}\nReference data: $config_hash{refdata}\nRead Length: $config_hash{read_length}\nDistance between two partner genes: $config_hash{distance}\nRNA Lib Size: $config_hash{lib_size}\nMinimal Read Pair: $config_hash{minimal}\nMaximal Fusion Isoforms: $config_hash{max_fusion_isoform}\n\n";
+##################################################################################################
+my $out_genome = "$project/BWA_aln_genome";
+my $out_junction = "$project/BWA_aln_Junction";
+my $mapq_thres = 20;		# the threshold of MAPQ values for "good" alignment score.
+my $pair = 1;
+my $sam_j = "$out_junction/sorted_sam";
+my $sam_g = "$out_genome/sorted_sam";
+###################################################################################################
+
+system ("dos2unix $project/sample_info.txt");
+open (LANE, "$project/sample_info.txt") or die "the file sample_info.txt could be found, $!";
+my @lanes;
+my $universal_count = 0;		# to cound the sample size
+my %sample_info = ();
+my $sample_title = <LANE>;		# the title
+chomp $sample_title;
+
+while (<LANE>)
+{
+	chomp $_;
+	my @arr = split(/\t/, $_);
+	$lanes[$universal_count] = $arr[0];
+	my $sample = 's_'.$arr[0];
+	$sample_info{$sample} = $_;
+	$universal_count++;
+}
+close (LANE);
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### register similar genes
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+print LOG "\n######################################################\nThe fusion Candidates are filtered out based on similarity \n\n";
+
+# keep record of similar transcripts
+my $similar_preblasted_file = 'similar_geneSymbol_W11_ReadLength_'.$config_hash{read_length}.'_BLASTN.txt';
+# similar_geneSymbol_W11_ReadLength_50_BLASTN_01-27-2012.txt
+
+#  similar_geneSymbol_W11_ReadLength_50_BLASTN.txt
+open (ID, "<", $config_hash{refdata}."/".$similar_preblasted_file) or die "$!";
+my %pair_similar = (); 		# keys: pair of transcripts, both direction; values: incremental
+while (<ID>)
+{
+	chomp $_;
+	my @array = split (/_/, $_);
+	my $key;
+	my $first = $array[0];
+	my $second = $array[1];
+	if ($first && $second)
+	{
+		$key = $first."-".$second;
+		$pair_similar{$key}++;
+		$key = $second."-".$first;
+		$pair_similar{$key}++;
+	}
+}
+close(ID);
+print "Done reading in Similar genes\n";
+
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### annotate both ends mapped reads, faster
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+print LOG "\n###################################################
+Annotate the both-end-mapped reads using the transcript definition defined in the FILTERED ucsc refFlat file\n\n";
+
+open (AMBPARTNER, ">$project/ambigous_partners.txt") or die "$!";
+# when one of the fusion partner is ambigous (overlap genes as one of the partner)
+
+my $categorized_reads = "$project/map";
+my @files = plainfiles ($categorized_reads);
+my $file;
+
+foreach $file (@files)
+{
+	if($file =~ m/\Q$categorized_reads\E\/(.+)_samse_both_end/)
+	{
+		my $sample = $1;
+		print "\n$sample\n";
+
+		#######################################
+		# filter out close genes, and register the reads with 2 ends apart
+		open (DATA, "<", $file) or die "$!";
+		my $in = <DATA>;		# the title
+		# Read_ID End1_Chr End1_Position Strand_1 Type End2_Chr End2_Position Strand_2 Type
+		my $count = 0;
+		my $used = 0;
+		my %start_yes = ();		#key: chr, position; value: yes, for the start of the read
+		my %end_yes = ();		#key: chr, position+50; value: yes; for the end of the read
+		open (TEMP, ">$categorized_reads/temp.txt") or die "$!";
+		print TEMP $in;
+		while ($in = <DATA>)
+		{
+			chomp $in;
+			$count++;
+			my $far = 0;
+			my @arr = split (/\t/, $in);
+
+			# not on the same Chr; not on one chr and one exon Junction; not on the same exon junction
+			if($arr[1] ne $arr[5])
+			{
+				$used++;
+				$far++;
+			}
+			else
+			{
+				my $dis = abs($arr[2]-$arr[6]);
+				if($dis >= $config_hash{distance})		# NOTE: filtering based on distance between the two partner genes; this GOT to be on both genome
+				{
+					$used++;
+					$far++;
+				}
+			}
+			if($far)
+			{
+				print TEMP "$in\n";
+				my $end1;
+				my $end2;
+				########################
+				# NOTE: for the junction mappings, no annoation is needed
+				if($arr[4] eq 'GENOME')
+				{
+					$end1 = $arr[2]+ $config_hash{read_length} - 1;
+					$start_yes{$arr[1]}{$arr[2]}++;
+					$end_yes{$arr[1]}{$end1}++;
+				}
+				if($arr[8] eq 'GENOME')
+				{
+					$end2 = $arr[6]+ $config_hash{read_length} - 1;
+					$start_yes{$arr[5]}{$arr[6]}++;
+					$end_yes{$arr[5]}{$end2}++;
+				}
+			}
+		}
+		close (TEMP);
+		close (DATA);
+		print "There are $count lines in the file, $used with two ends farther away than the defined distance\n";
+
+		open (GENE, "<", $config_hash{refdata}."/ucsc_refFlat_filtered.txt") or die "$!";
+		#genesymbol ACC chrom strand txStart txEnd cdsStart cdsEnd exonCount exonStarts exonEnds
+
+		$in = <GENE>;		# title
+		$count = 0;
+		my $out = 0;
+		while ($in = <GENE>)
+		{
+			chomp $in;
+			my @array = split (/\t/, $in);
+			if($array[2] && $array[0])		#if there is a chr AND there is a gene symbol
+			{
+				my @exon1 = split(/,/, $array[9]);
+				my @exon2 = split(/,/, $array[10]);
+				# NOTE: tested, size 1 always equals to size 2
+				# NOTE: tested, the exonCount always equals to sizes
+				# NOTE: tested, all positions in exon1 and exon2 are in ascending order
+				my $num = $array[8];		# number of exons
+
+				## Exons
+				# 4 situation:	1. start of a read in exon, end also in exon;
+				#		2. start of a read in exon, end out of exon
+				#		3. start of a read out of exon, end in exon
+				#		4. exon smaller than the read, so both start and end are outside of exon
+				for(my $k=0; $k<$num; $k++)		# for each exon
+				{
+					my $start_exon = $exon1[$k]+1;	# NOTE: 0-based start
+					my $end_exon = $exon2[$k];
+					# NOTE: 4. exon smaller than the read, so both start and end are outside of exon
+					# this situation will be covered in junction reads.
+
+					# NOTE: if at least one end is in exon
+					for (my $n=$start_exon; $n<=$end_exon; $n++)
+					{
+						if ($start_yes{$array[2]}{$n})
+						# 	1. start of a read in exon, end also in exon;
+						#	2. start of a read in exon, end out of exon
+						{
+							if($start_yes{$array[2]}{$n} =~ m/^\d+$/)	# origanally are counts only
+							{	$start_yes{$array[2]}{$n} = $array[0];	}
+							else
+							# already mapped to a gene
+							{	$start_yes{$array[2]}{$n} = $start_yes{$array[2]}{$n}.','.$array[0];}
+						}
+						if ($end_yes{$array[2]}{$n})
+						# NOTE: can not use elsif here. the same position can be the start of one read, and the end of another
+						{
+							my $start_read = $n - $config_hash{read_length} + 1;
+							if($start_read < $start_exon)
+							# 4. exon smaller than the read, so both start and end are outside of exon
+							{
+								# need to track the start of the read: the SAM files only has the start position
+								if($start_yes{$array[2]}{$start_read} =~ m/^\d+$/)	# origanally
+								{	$start_yes{$array[2]}{$start_read} = $array[0];	}
+								else		# already mapped to a gene
+								{
+									$start_yes{$array[2]}{$start_read} = $start_yes{$array[2]}{$start_read}.','.$array[0];
+								}
+							}
+						}
+					}
+				}
+				$count++;
+			}
+			else {	print "Either chr or gene symbol missing \n";	}
+		}
+		close (GENE);
+		print "There are $count genes with both Chr and symbol\n";
+
+		## 2nd pass of the files, identify the fusion gene candidates
+		my $outf = $sample."_filtered_fusion_reads.txt";
+		print LOG "\nGenerate ${sample}_filtered_fusion_reads.txt: this file records the reads in support of fusion genes, including reads with one end of the exon boundaries defined by the refFlat file.\n";
+
+		open (DATA, "$categorized_reads/temp.txt") or die "$!";
+		$in = <DATA>;		# the title
+		chomp $in;
+		open (FUSE, ">$project/fusion_candidates/$outf") or die "$!";
+		print FUSE "$in\tGene1\tGene2\n";
+
+		my $fusion_mapped = 0;
+		while ($in = <DATA>)
+		{
+			chomp $in;
+			my @array = split (/\t/, $in);
+			# Read_ID End1_Chr End1_Position Strand_1 TYPE End2_Chr End2_Position Strand_2 TYPE
+			my $read1 = $start_yes{$array[1]}{$array[2]};
+			my $read2 = $start_yes{$array[5]}{$array[6]};
+
+			if (($array[4] eq 'GENOME') && ($array[8] eq 'GENOME'))	# BOTH TO GENOME
+			{
+				if(($read1 =~ m/\D/) && ($read2 =~ m/\D/))
+				# only care about situations where both ends mapped to genes
+				{
+					if($read1 ne $read2)
+					{
+						my @genes1 = split(/,/, $read1);
+						my @genes2 = split(/,/, $read2);
+						my @sorted1 = sort {$a cmp $b} @genes1;
+						my @sorted2 = sort {$a cmp $b} @genes2;
+						my $size1 = scalar(@sorted1);
+						my $size2 = scalar(@sorted2);
+
+						my %exist = ();
+						my @nr1 = ();
+						my $use1 = 0;
+						for(my $l=0; $l<$size1; $l++)
+						{
+							if(!($exist{$sorted1[$l]}))
+							{
+								$nr1[$use1] = $sorted1[$l];
+								$use1++;
+								$exist{$sorted1[$l]}++;
+							}
+						}
+
+						%exist = ();
+						my @nr2 = ();
+						my $use2 = 0;
+						for(my $l=0; $l<$size2; $l++)
+						{
+							if(!($exist{$sorted2[$l]}))
+							{
+								$nr2[$use2] = $sorted2[$l];
+								$use2++;
+								$exist{$sorted2[$l]}++;
+							}
+						}
+
+						my $found = 0;
+						for(my $l=0; $l<$use1; $l++)
+						{
+							for (my $h=0; $h<$use2; $h++)
+							{
+								if($nr1[$l] eq $nr2[$h])
+								{
+									$found++;
+									last;
+								}
+							}
+						}
+						if(!($found))
+						{
+							# record the ambigous partners
+							if ($use1>1)	{	print AMBPARTNER "@nr1\n";	}
+							if ($use2>1)	{	print AMBPARTNER "@nr2\n";	}
+
+							for(my $l=0; $l<$use1; $l++)
+							{
+								for (my $h=0; $h<$use2; $h++)
+								{
+									my $pair = $nr1[$l].'-'.$nr2[$h];
+									if (!($pair_similar{$pair}))
+									{	print FUSE "$in\t$nr1[$l]\t$nr2[$h]\n";	}
+									# may have redundant read entry when an ambigous partner is involved
+								}
+							}
+							$fusion_mapped++;
+						}
+					}
+				}
+			}
+
+			elsif (($array[4] eq 'GENOME') && ($read1 =~ m/\D/))	# First TO GENOME, second to Junction
+			{
+				my @genes1 = split(/,/, $read1);
+				my @sorted1 = sort {$a cmp $b} @genes1;
+				my $size1 = scalar(@sorted1);
+
+				my %exist = ();
+				my @nr1 = ();
+				my $use1 = 0;
+				for(my $l=0; $l<$size1; $l++)
+				{
+					if(!($exist{$sorted1[$l]}))
+					{
+						$nr1[$use1] = $sorted1[$l];
+						$use1++;
+						$exist{$sorted1[$l]}++;
+					}
+				}
+
+				my $gene2;
+				if($array[5] =~ m/chr.+_(.+):.+_.+$/)	{	$gene2 = $1;	}
+				# 2742270_E5:37_E6:49_chr5_TTC1:NM_003314
+
+				my $found = 0;
+				for(my $l=0; $l<$use1; $l++)
+				{
+					if($nr1[$l] eq $gene2)
+					{
+						$found++;
+						last;
+					}
+				}
+				if(!($found))
+				{
+					# record the ambigous partners
+					if ($use1>1)	{	print AMBPARTNER "@nr1\n";	}
+					for(my $l=0; $l<$use1; $l++)
+					{
+						my $pair = $nr1[$l].'-'.$gene2;
+						if (!($pair_similar{$pair}))
+						{	print FUSE "$in\t$nr1[$l]\t$gene2\n";	}
+					}
+					$fusion_mapped++;
+				}
+			}
+
+			elsif (($array[8] eq 'GENOME') && ($read2 =~ m/\D/))	# First TO Junction, second to GENOME
+			{
+				my @genes2 = split(/,/, $read2);
+				my @sorted2 = sort {$a cmp $b} @genes2;
+				my $size2 = scalar(@sorted2);
+
+				my %exist = ();
+				my @nr2 = ();
+				my $use2 = 0;
+				for(my $l=0; $l<$size2; $l++)
+				{
+					if(!($exist{$sorted2[$l]}))
+					{
+						$nr2[$use2] = $sorted2[$l];
+						$use2++;
+						$exist{$sorted2[$l]}++;
+					}
+				}
+
+				my $gene1;
+				if($array[1] =~ m/chr.+_(.+):.+_.+$/)	{	$gene1 = $1;	}
+				# 2742270_E5:37_E6:49_chr5_TTC1:NM_003314
+
+				my $found = 0;
+				for(my $l=0; $l<$use2; $l++)
+				{
+					if($nr2[$l] eq $gene1)
+					{
+						$found++;
+						last;
+					}
+				}
+				if(!($found))
+				{
+					if ($use2>1)	{	print AMBPARTNER "@nr2\n";	}
+					for(my $l=0; $l<$use2; $l++)
+					{
+						my $pair = $gene1.'-'.$nr2[$l];
+						if (!($pair_similar{$pair}))
+						{	print FUSE "$in\t$gene1\t$nr2[$l]\n";	}
+					}
+					$fusion_mapped++;
+				}
+			}
+
+			if (($array[4] eq 'JUNCTION') && ($array[8] eq 'JUNCTION'))	# BOTH TO JUNCTION
+			{
+				my $gene1;
+				my $gene2;
+				if($array[1] =~ m/chr.+_(.+):.+_.+$/)	{	$gene1 = $1;	}
+				# 2742270_E5:37_E6:49_chr5_TTC1:NM_003314
+				if($array[5] =~ m/chr.+_(.+):.+_.+$/)	{	$gene2 = $1;	}
+				# 2742270_E5:37_E6:49_chr5_TTC1:NM_003314
+				if($gene1 ne $gene2)
+				{
+					my $pair = $gene1.'-'.$gene2;
+					if (!($pair_similar{$pair}))
+					{	print FUSE "$in\t$gene1\t$gene2\n";	}
+					$fusion_mapped++;
+				}
+			}
+		}
+		close(DATA);
+		close (FUSE);
+		print "\nThere are $fusion_mapped read pairs that are fusion gene candidates\n";
+		print LOG "There are $fusion_mapped read pairs that are fusion gene candidates\n\n";
+		%start_yes = ();		#key: chr, position; value: yes, for the start of the read
+		%end_yes = ();		#key: chr, position+50; value: yes; for the end of the read
+	}
+}
+
+system ("rm $categorized_reads/temp.txt");
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### summarize fusion reads into unqiue fusion pairs, get # of clusters
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+my %fusion_gene_sample = ();	# key: fusion gene partner, and sample; value:count
+# NOTE: the fusion candidates here will be after passing the filtering of distance, similarity, abundance, and # of clusters
+my %fusion_pair_sample = ();	#key: fusion gene pair, and sample; value: count
+
+my %pair_end_dir = ();	# key: sample###pair, and end mapping directions; values:  counts	# NOTE: for genome mapping pairs only.
+
+print LOG "\n######################################################\nTo further filter the fusion candidates based on RNA-Seq library size and the distance between the ends that mapped onto genome and to the same fusion partner\nThe libaray size is user defined\nthe minimal fusion encompassing read pairs are 2\n\n";
+
+my $dir_candidates = "$project/fusion_candidates";
+@files = plainfiles ($dir_candidates);
+
+foreach $file (@files)
+{
+	if ($file =~ m/\Q$dir_candidates\E\/(.+)_filtered_fusion_reads/)
+	# only genome
+	{
+		my $sample = $1;
+		print "\n$sample\n";
+
+		open (READ, "$file") or die "$!";
+		#Read_ID End1_Chr End1_Position Strand_1 TYPE End2_Chr End2_Position Strand_2 Type Gene1 Gene2
+		my $in = <READ>;		#title
+		#first pass to record the pair with sufficent counts first
+		my %pair_c = ();
+		while ($in = <READ>)
+		{
+			chomp $in;
+			my @arr = split (/\t/, $in);
+			my $pair;
+			if($arr[9] lt $arr[10])	{	$pair = $arr[9].'_'.$arr[10];	}
+			else	{	$pair = $arr[10].'_'.$arr[9];	}
+
+			$pair_c{$pair}++;
+		}
+		close (READ);
+
+		# 2nd pass;
+		open (READ, "$file") or die "$!";
+		#Read_ID End1_Chr End1_Position Strand_1 TYPE End2_Chr End2_Position Strand_2 Type Gene1 Gene2
+		my $title = <READ>;		# title
+		chomp $title;
+		my $temp = $sample.'_fusion_reads_minimal_abundance_'.$config_hash{minimal}.'.txt';
+		open (TEMP, ">$dir_candidates/$temp") or die "$!";
+		my %pair_g1_pos = ();	# key: pair, (gene1) value: positions
+		my %pair_g2_pos = ();	# key: pair, (Gene2) value: psotions
+		my %pair_cg2 = ();	# Key: pair; value: count of 2 genomic alignment
+		my %pair_cj2 = ();	# key: pair; value: count of 2 junction alignment		## NOTE NOTE NOTE: no cj2 counts in any of the genes!! WHY?
+		my %pair_cgj = ();	# key: pair; value: count of one alinged to g, one aligned to i
+
+		while (my $in = <READ>)
+		{
+			chomp $in;
+			my @arr = split (/\t/, $in);
+			my $pair;
+
+			if($arr[9] lt $arr[10])
+			{
+				$pair = $arr[9].'_'.$arr[10];
+			}
+			else {	$pair = $arr[10].'_'.$arr[9];	}
+
+			my $sample_pair = $sample.'###'.$pair;		# the overlap genes will be separated in different PAIRs
+
+			# NOTE: this only makes sense for reads mapped to genome, since distances between reads mapped to exon junctions are difficult to calculate
+			if($pair_c{$pair} >= $config_hash{minimal})
+			{
+				if(($arr[4] eq 'GENOME') && ($arr[8] eq 'GENOME'))
+				#Read_ID End1_Chr End1_Position Strand_1 TYPE End2_Chr End2_Position Strand_2 Type Gene1 Gene2
+				# my %pair_end_dir = ();	# key: sample###key, and end mapping directions; values:  counts	# NOTE: for genome mapping pairs only.
+				{
+					if($arr[9] lt $arr[10])
+					{
+						my $dir_end1 = $arr[3];
+						if(!($arr[3]))	{	$dir_end1 = 'f';	}		# forward are empty, reverse are 'r'
+
+						my $dir_end2 = $arr[7];
+						if(!($arr[7]))	{	$dir_end2 = 'f';	}
+
+						my $direction_both_ends = $dir_end1.'_'.$dir_end2;
+						$pair_end_dir{$sample_pair}{$direction_both_ends}++;
+
+						if($pair_g1_pos{$pair})	{	$pair_g1_pos{$pair} = $pair_g1_pos{$pair}.','.$arr[2];	}
+						else	{	$pair_g1_pos{$pair} = $arr[2];	}
+						if($pair_g2_pos{$pair})	{	$pair_g2_pos{$pair} = $pair_g2_pos{$pair}.','.$arr[6];	}
+						else	{	$pair_g2_pos{$pair} = $arr[6];	}
+					}
+					else
+					{
+						my $dir_end1 = $arr[7];
+						if(!($arr[7]))	{	$dir_end1 = 'f';	}		# forward are empty, reverse are 'r'
+
+						my $dir_end2 = $arr[3];
+						if(!($arr[3]))	{	$dir_end2 = 'f';	}
+
+						my $direction_both_ends = $dir_end1.'_'.$dir_end2;
+						$pair_end_dir{$sample_pair}{$direction_both_ends}++;
+
+						if($pair_g2_pos{$pair})	{	$pair_g2_pos{$pair} = $pair_g2_pos{$pair}.','.$arr[2];}
+						else	{	$pair_g2_pos{$pair} = $arr[2];	}
+						if($pair_g1_pos{$pair})	{	$pair_g1_pos{$pair} = $pair_g1_pos{$pair}.','.$arr[6];	}
+						else	{	$pair_g1_pos{$pair} = $arr[6];	}
+					}
+					$pair_cg2{$pair}++;
+
+				}
+				elsif(($arr[4] eq 'JUNCTION') && ($arr[8] eq 'JUNCTION'))
+				{	$pair_cj2{$pair}++;	}
+				else
+				{	$pair_cgj{$pair}++;	}
+
+				print TEMP "$in\t$sample\n";
+			}
+		}
+		close (READ);
+		close (TEMP);
+
+		my %pair_dis = ();		# the distance of reads within the side of one gene;
+		my @pairs = keys(%pair_c);
+		my $p;
+		my $summary = $sample."_fusion_summary.txt";
+		my $mkdir_c = 0;
+		open (OUT, ">$project/fusion_candidates/$summary") or die "$!";
+		print OUT "GenePair\tTotal_pairs\tPairs(g2)\tPairs(j2)\tPairs(gj)\tCluster_E1(g)\tCluster_E2(g)\tBiggest_Cluster_E1(g)\tBiggest_Cluster_E2(g)\n";
+		foreach $p (@pairs)
+		{
+			if($pair_c{$p} >= $config_hash{minimal})	# need at least minimal total pairs
+			# NOTE: here the candidates are only nominated using this minimal encompassing pair threshold. Lateron, this threshold is relaxed because we need to list all samples with fusion junction spanning reads even when the # of encompassing reads are not > the threshold
+			{
+				my @ggg = split (/_/, $p);
+				my @pos1 = split (/,/, $pair_g1_pos{$p});
+				my @pos2 = split (/,/, $pair_g2_pos{$p});
+				my $size1 = scalar(@pos1);
+				my $size2 = scalar(@pos2);
+
+				my @sortpos1 = sort {$a <=> $b} @pos1;
+				my @sortpos2 = sort {$a <=> $b} @pos2;
+
+				##################################################################
+				# NOTE: def of cluster: group of read with dist < lib_size
+				# 1st END
+				my @cluster1_size = ();		# the array of cluster sizes;
+				my @cluster2_size = ();
+				my $c1 = 0; 	# number of clusters for gene1;
+				my $c2 = 0;
+				my $start1 = $sortpos1[0];
+
+				$cluster1_size[$c1] = 1;		#at least 1;
+				$cluster2_size[$c2] = 1;		#at least 1;
+
+				for(my $k=1; $k<$size1; $k++)
+				{
+					my $distance = $sortpos1[$k] - $start1;
+					if($distance <= $config_hash{lib_size})
+					{
+						$cluster1_size[$c1]++;
+					}
+					else
+					{
+						$c1++;
+						$start1 = $sortpos1[$k];
+						$cluster1_size[$c1] = 1;
+					}
+				}
+
+				## update by Jaysheel
+				## cannot gurantee that cluster1_size will
+				## always be 2 or more elements.
+				my $large1 = $cluster1_size[0];
+				if (scalar(@cluster1_size) > 1) {
+					my @sor1 = sort{$b<=>$a} @cluster1_size;
+					$large1 = $sor1[0];
+				}
+
+				my $start2 = $sortpos2[0];
+				for(my $k=1; $k<$size2; $k++)
+				{
+					my $distance = $sortpos2[$k] - $start2;
+					if($distance <= $config_hash{lib_size})
+					{
+						$cluster2_size[$c2]++;
+					}
+					else
+					{
+						$c2++;
+						$start2 = $sortpos2[$k];
+						$cluster2_size[$c2] = 1;
+					}
+				}
+
+				## update by Jaysheel
+				## cannot gurantee that cluster2_size will
+				## always be 2 or more elements.
+				my $large2 = $cluster2_size[0];
+				if (scalar(@cluster2_size) > 1) {
+					my @sor2 = sort{$b<=>$a} @cluster2_size;
+					$large2 = $sor2[0];
+				}
+
+			#	if (($pair_cg2{$p} >= 2) && ($c1<=3) && ($c2<=3))
+				if ($pair_cg2{$p} >= 2)
+				# NOTE: cap the maximum of the isoforms to 3
+				# NOTE: only when there are >1 genome mapped pairs
+				{
+					$fusion_gene_sample{$ggg[0]}{$sample}++;
+					$fusion_gene_sample{$ggg[1]}{$sample}++;
+					$fusion_pair_sample{$p}{$sample}++;
+					print OUT "$p\t$pair_c{$p}\t$pair_cg2{$p}\t$pair_cj2{$p}\t$pair_cgj{$p}\t$c1\t$c2\t$large1\t$large2\n";
+				}
+			}
+		}
+		close (OUT);
+		%pair_g1_pos = ();	# key: pair, (gene1) value: positions
+		%pair_g2_pos = ();	# key: pair, (Gene2) value: psotions
+		%pair_cg2 = ();	# Key: pair; value: count of 2 genomic alignment
+		%pair_cj2 = ();	# key: pair; value: count of 2 junction alignment
+		%pair_cgj = ();	# key: pair; value: count of one alinged to g, one aligned to i
+	}
+}
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### annotate one end mapped reads, faster
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+print LOG "\n###################################################\nAnnotate the one-end-mapped reads using the transcript definition defined in the FILTERED ucsc refFlat file\n\n";
+@files = plainfiles ($categorized_reads);
+
+foreach $file (@files)
+{
+	if($file =~ m/\Q$categorized_reads\E\/(.+)_samse_one_end/)
+	{
+		my $sample = $1;
+		print "\n$sample\n";
+
+		#######################################
+		# filter out close genes
+		open (DATA, "$file") or die "$!";
+		my $in = <DATA>;		# the title
+		# Read_ID End1_Chr End1_Position Strand_1 Type End2_Chr End2_Position Strand_2 Type
+		my $count = 0;
+		my $used = 0;
+		my %start_yes = ();		#key: chr, position; value: yes
+		my %end_yes = ();		#key: chr, position+50; value: e
+		$in = <DATA>;		# the title
+		while ($in = <DATA>)
+		{
+			chomp $in;
+			my @arr = split (/\t/, $in);
+			$count++;
+
+			my $end1;
+			my $end2;
+			########################
+			# NOTE: for the junction mappings, no annoation is needed
+			if($arr[4] eq 'GENOME')		# if the 1st end mapped, and to genome
+			{
+				$end1 = $arr[2]+ $config_hash{read_length} - 1;
+				$start_yes{$arr[1]}{$arr[2]}++;
+				$end_yes{$arr[1]}{$end1}++;
+				$used++;
+			}
+			if((scalar(@arr) == 9) && ($arr[8] eq 'GENOME'))
+			{
+				$end2 = $arr[6]+ $config_hash{read_length} - 1;
+				$start_yes{$arr[5]}{$arr[6]}++;
+				$end_yes{$arr[5]}{$end2}++;
+				$used++;
+			}
+		}
+		close (DATA);
+		print "Among $count total of one end mapped reads, $used mapped to genome\n";
+		print LOG "Among $count total of one end mapped reads, $used mapped to genome\n";
+
+		open (GENE, "<", $config_hash{refdata}."/ucsc_refFlat_filtered.txt") or die "$!";
+		#genesymbol ACC chrom strand txStart txEnd cdsStart cdsEnd exonCount exonStarts exonEnds
+		$in = <GENE>;		# title
+		$count = 0;
+		my $out = 0;
+		while ($in = <GENE>)
+		{
+			chomp $in;
+			my @array = split (/\t/, $in);
+			if($array[2] && $array[0])		#if there is a chr AND there is a gene symbol
+			{
+				my @exon1 = split(/,/, $array[9]);
+				my @exon2 = split(/,/, $array[10]);
+				# NOTE: tested, size 1 always equals to size 2
+				# NOTE: tested, the exonCount always equals to sizes
+				# NOTE: tested, all positions in exon1 and exon2 are in ascending order
+				my $num = $array[8];		# number of exons
+
+				# 4 situation:	1. start of a read in exon, end also in exon;
+				#		2. start of a read in exon, end out of exon
+				#		3. start of a read out of exon, end in exon
+				#		4. exon smaller than the read, so both start and end are outside of exon
+				for(my $k=0; $k<$num; $k++)		# for each exon
+				{
+					my $start_exon = $exon1[$k]+1;	# NOTE: 0-based start
+					my $end_exon = $exon2[$k];
+					# NOTE: 4. exon smaller than the read, so both start and end are outside of exon
+					# this situation will be covered in junction reads.
+
+					# NOTE: if at least one end is in exon
+					for (my $n=$start_exon; $n<=$end_exon; $n++)
+					{
+						if ($start_yes{$array[2]}{$n})
+						# 	1. start of a read in exon, end also in exon;
+						#	2. start of a read in exon, end out of exon
+						{
+
+							if($start_yes{$array[2]}{$n} =~ m/^\d+$/)	# origanally are counts only
+							{	$start_yes{$array[2]}{$n} = $array[0];	}
+							else
+							# already mapped to a gene
+							{	$start_yes{$array[2]}{$n} = $start_yes{$array[2]}{$n}.','.$array[0];}
+						}
+						if ($end_yes{$array[2]}{$n})
+						# NOTE: can not use elsif here. the same position can be the start of one read, and the end of another
+						{
+							my $start_read = $n - $config_hash{read_length} + 1;
+							if($start_read < $start_exon)
+							# 4. exon smaller than the read, so both start and end are outside of exon
+							{
+								# need to track the start of the read: the SAM files only has the start position
+								if($start_yes{$array[2]}{$start_read} =~ m/^\d+$/)	# origanally
+								{	$start_yes{$array[2]}{$start_read} = $array[0];	}
+								else		# already mapped to a gene
+								{
+									$start_yes{$array[2]}{$start_read} = $start_yes{$array[2]}{$start_read}.','.$array[0];
+								}
+							}
+						}
+					}
+				}
+				$count++;
+			}
+		}
+		close (GENE);
+
+		## 2nd pass of the files, identify the fusion gene candidates
+		my $outf = $sample."_one_end_annotated.txt";
+		print LOG "\nGenerate ${sample}_one_end_annotated.txt: this file records the annotation of the reads with one end mapped, including reads out of the exon boundaries defined by the refFlat file.\n";
+
+		open (DATA, "$file") or die "$!";
+		$in = <DATA>;		# the title
+		chomp $in;
+		open (FUSE, ">$project/fusion_candidates/$outf") or die "$!";
+		print FUSE "$in\tGene\n";
+		$count = 0;
+		my $annot = 0;
+
+		while ($in = <DATA>)
+		{
+			chomp $in;
+			$count++;
+			my @array = split (/\t/, $in);
+			# Read_ID End1_Chr End1_Position Strand_1 TYPE End2_Chr End2_Position Strand_2 TYPE
+			my $read1 = $start_yes{$array[1]}{$array[2]};
+			my $read2 = $start_yes{$array[5]}{$array[6]};
+
+			if (($array[4] eq 'GENOME') && ($read1 =~ m/\D/))	# First TO GENOME
+			{
+				my @genes1 = split(/,/, $read1);
+				my $size1 = scalar(@genes1);
+
+				my %exist = ();
+				my @nr1 = ();
+				my $c_nr = 0;
+				for(my $l=0; $l<$size1; $l++)
+				{
+					if((!($exist{$genes1[$l]})) && ($fusion_gene_sample{$genes1[$l]}{$sample}))
+					{
+						print FUSE "$in\t\t\t\t\t$genes1[$l]\n";
+						$exist{$genes1[$l]}++;
+						$nr1[$c_nr] = $genes1[$l];
+						$c_nr++;
+					}
+				}
+				if($c_nr>1)	{	print AMBPARTNER "@nr1\n";	}
+				if($c_nr>=1)	{	$annot++;	}
+			}
+
+			elsif (($array[8] eq 'GENOME') && ($read2 =~ m/\D/))	# 2nd to GENOME
+			{
+				my @genes2 = split(/,/, $read2);
+				my $size2 = scalar(@genes2);
+
+				my %exist = ();
+				my @nr2 = ();
+				my $c_nr = 0;
+				for(my $l=0; $l<$size2; $l++)
+				{
+					if((!($exist{$genes2[$l]})) && ($fusion_gene_sample{$genes2[$l]}{$sample}))
+					{
+						print FUSE "$in\t$genes2[$l]\n";
+						$exist{$genes2[$l]}++;
+						$nr2[$c_nr] = $genes2[$l];
+						$c_nr++;
+					}
+				}
+				if($c_nr>1)	{	print AMBPARTNER "@nr2\n";	}
+				if($c_nr>=1)	{	$annot++;	}
+			}
+
+			elsif ($array[4] eq 'JUNCTION') 	# 1st to junction
+			{
+				my $gene1;
+				if($array[1] =~ m/chr.+_(.+):.+_.+$/)	{	$gene1 = $1;	}
+				# 2742270_E5:37_E6:49_chr5_TTC1:NM_003314
+				if($fusion_gene_sample{$gene1}{$sample})
+				{
+					print FUSE "$in\t\t\t\t\t$gene1\n";
+					$annot++;
+				}
+			}
+
+			elsif($array[8] eq 'JUNCTION')
+			{
+				my $gene2;
+				if($array[5] =~ m/chr.+_(.+):.+_.+$/)	{	$gene2 = $1;	}
+				# 2742270_E5:37_E6:49_chr5_TTC1:NM_003314
+				if($fusion_gene_sample{$gene2}{$sample})
+				{
+					print FUSE "$in\t$gene2\n";
+					$annot++;
+				}
+			}
+		}
+		close(DATA);
+		close (FUSE);
+		print "Out of $count one-end mapped reads, $annot were annotated to fusion candidate genes\n";
+		print LOG "Out of $count one-end mapped reads, $annot were annotated to fusion candidate genes\n";
+		%start_yes = ();		#key: chr, position; value: yes
+		%end_yes = ();		#key: chr, position+50; value: e
+	}
+}
+close (AMBPARTNER);
+print "\n\tEXIT Jaysheel\n";
+exit();
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### Get the fasta file of the reads whose partner involves in fusion
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+
+# NOTE: this program goes to the fusion summary file (fusion candidates), filter, and write out the fasta files of reads with the other end mapped to one of the partners;
+
+print LOG "\n###################################################
+Get the fasta file of the reads whose partner involves in fusion\n\n";
+
+open (FASTA_ONE, ">$project/fasta_fusion_one_end_mapped/all_sample_one_end_mapped.fasta") or die "$!";
+my %all_genes_in_fusion = ();		# all single genes involved in fusion
+
+@files = plainfiles ($dir_candidates);
+foreach $file (@files)
+{
+	if($file =~ m/\Q$dir_candidates\E\/(.+)_fusion_summary/)
+	{
+		my $sample = $1;
+		print "$sample\n";
+		print LOG "$sample\n";
+
+		########################################################
+		# get the genes that are involved in fusion first
+		open (GENE, "$file") or die "$!";
+		#GenePair\tTotal_pairs\tPairs(g2)\tPairs(j2)\tPairs(gj)\tCluster_E1(g)\tCluster_E2(g)\tBiggest_Cluster_E1(g)\tBiggest_Cluster_E2(g)
+		my $count = 0;
+		my %gene_fusion = (); 		# key: gene; value: count. This is necessary because this is sample specific
+		my $in = <GENE>;			# title
+		while ($in = <GENE>)
+		{
+			my @array = split(/\t/, $in);
+			my @genes = split(/_/, $array[0]);	# the first element is the gene pair
+			$gene_fusion{$genes[0]}++;
+			$gene_fusion{$genes[1]}++;
+			$all_genes_in_fusion{$genes[0]}++;
+			$all_genes_in_fusion{$genes[1]}++;
+		}
+		close (GENE);
+		my @recorded = keys(%gene_fusion);
+		my $counted = scalar(@recorded);
+
+		print "There are $counted genes involved in fusion candidates\n";
+		print LOG "There are $counted genes involved in fusion candidates\n";
+
+		########################################################
+		# get the chr positons that are only in one_end_mapped file
+		my $one = $sample.'_one_end_annotated.txt';
+		print "$one\n";
+		print LOG "$one\n";
+		open (DATA, "$dir_candidates/$one") or die "$!";
+		#Read_ID\tEnd1_Chr\tEnd1_Position\tStrand_1\tType\tEnd2_Ch\tEnd2_Position\tStrand_2\tType\tGene
+		$in = <DATA>;		# the title
+
+		my %read1_gene = ();	# key: read ID; value: gene;
+		my %read2_gene = ();	# key: read ID; value: gene;
+		while ($in = <DATA>)
+		{
+			chomp $in;
+			my @arr = split (/\t/, $in);
+
+			# all reads in this file are only from fusion partner mappings, SUPPOSEDLY # NOTE: yes, tested
+		#	if($gene_fusion{$arr[9]})
+		#	{
+				if($arr[4])	# if end 1 mapped, retrieve end 2
+				{
+					$read2_gene{$arr[0]} = $arr[9];
+
+				}
+				elsif($arr[8])
+				{
+					$read1_gene{$arr[0]} = $arr[9];
+				}
+		#	}
+			#else
+			#{	print "Something is wrong, not all reads in one-end-annoated are from fusion partner mapping\n";	}
+			# NOTE: tested, all reads in the one-end annoated files are from fusion partner mapping, meaning the other end in the pairs is known to map to one of the fusion partners
+		}
+		close (DATA);
+
+		########################################################
+	#	my $endone = $sample.'_1_sequence';
+		my $endone = $sample.'_1_ID_sorted.sam';
+	#	my $endtwo = $sample.'_2_sequence';
+		my $endtwo = $sample.'_2_ID_sorted.sam';
+	#	open (ONE, "$project/fastq_temp/$endone") or die "$!";
+		open (ONE, "$sam_g/$endone") or die "$!";
+		print "$endone\n";
+	#	my $exclude = 0;
+		while($in = <ONE>)
+		{
+		#	if($in =~ m/^.((.+)\/\d)/)
+		#	{
+				# because in the SAM file, the end information is lost
+		#		my $id = $2;
+		#		my $id_end = $2.'/1';	# end 1 doesn't alway end with /1, need to reformat'
+		#		$in = <ONE>;
+		#		if(($read1_gene{$id}) && ($in !~ m/NNNNN/))
+		#		{
+		#			print FASTA_ONE ">$read1_gene{$id}###$sample###$id_end\n$in";
+					# the gene is the ID of the gene the other end mapped to.
+		#		}
+		#		$in = <ONE>;
+		#		$in = <ONE>;
+		#	}
+
+			my @arr = split (/\t/, $in);
+			my $id = $arr[0];
+			my $id_end = $id.'/1';
+			if(($read1_gene{$id}) && ($in !~ m/NNNNN/))
+			{
+				print FASTA_ONE ">$read1_gene{$id}###$sample###$id_end\n$arr[9]\n";
+			}
+	#		if(($read1_gene{$id}) && ($in =~ m/NNNNN/))	{	$exclude++;	}
+		}
+		close(ONE);
+	#	print "$exclude excluded because of NNNNN\n";
+	#	open (TWO, "$project/fastq_temp/$endtwo") or die "$!";
+		open (TWO, "$sam_g/$endtwo") or die "$!";
+		print "$endtwo\n";
+		while($in = <TWO>)
+		{
+		#	if($in =~ m/^.((.+)\/\d)/)
+		#	{
+		#		my $id = $2;
+		#		my $id_end = $2.'/2';
+		#		$in = <TWO>;
+
+		#		if(($read2_gene{$id}) && ($in !~ m/NNNNN/))
+		#		{
+		#			print FASTA_ONE ">$read2_gene{$id}###$sample###$id_end\n$in";
+					# the gene is the ID of the gene the other end mapped to.
+		#		}
+		#		$in = <TWO>;
+		#		$in = <TWO>;
+		#	}
+			my @arr = split (/\t/, $in);
+			my $id = $arr[0];
+			my $id_end = $id.'/2';
+			if(($read2_gene{$id}) && ($in !~ m/NNNNN/))
+			{
+				print FASTA_ONE ">$read2_gene{$id}###$sample###$id_end\n$arr[9]\n";
+			}
+	#		if(($read2_gene{$id}) && ($in =~ m/NNNNN/))	{	$exclude++;	}
+		}
+		close(TWO);
+	#	print "$exclude excluded because of NNNNN\n";
+	}
+}
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### get all exon fasta from genes involved in all fusion candidates and form a smaller blast_db
+### NOTE: need to add all junctions as well, since some alignment will span the junction
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+open (EXON, "<", $config_hash{refdata}."/ucsc_refflat_exon.fasta") or die "$!";
+open (F_EXON, ">$project/exon_fusion.fasta") or die "$!";
+# >E2:chr1:GJC2:NM_020435:226412063:226414150:+
+my $count_exon = 0;
+while(my $in = <EXON>)
+{
+	my @arr = split (/:/, $in);
+	if($all_genes_in_fusion{$arr[2]})
+	{
+		print F_EXON $in;
+		$in = <EXON>;
+		print F_EXON $in;
+		$count_exon++;
+	}
+}
+print "There are $count_exon exons from genes that are potentially involved in fusion\n";
+close(EXON);
+
+# ### NOTE: to be implemented
+#my $junc_readlength = 'exon_junction_read_length_'.$read_length.'_build36.fa';
+#open (JUNC, "$refdata/$junc_readlength") or die "$!";
+#my $count_junc = 0;
+#while($in = <JUNC>)
+# >12_E36:49_E42:49_chr7_COL1A2:NM_000089
+#{
+#	if($in =~ m/chr.+_(.+):/)
+#	{
+#		if($all_genes_in_fusion{$1})
+#		{
+#			print F_EXON $in;
+#			$in = <JUNC>;
+#			print F_EXON $in;
+#			$count_junc++;
+#		}
+#	}
+#}
+#print "There are $count_junc jucntions from genes that are potentially involved in fusion\n";
+#close(JUNC);
+
+close(F_EXON);
+
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### FUSION JUNCTION FINDER by blasting
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+print LOG "\n#####################################################\nTo find junction spanning reads for fusion genes\n\n";
+system("formatdb -t $project/eeexon -i $project/exon_fusion.fasta -p F -o T -n $project/eeexon");
+
+# blast all single end reads involved in fusion against the exon blast_db
+# devide the reads into smaller files (50000 reads each; )
+open (RESULT, ">$project/megablast_summary.txt") or die "$!";
+open (FASTA, "$project/fasta_fusion_one_end_mapped/all_sample_one_end_mapped.fasta") or die "$!";
+
+my $temp_file_count = 0;
+my $fasta_read_count = 0;
+my $temp_fasta = 'temp.fasta';
+open (TEMP, ">$project/fasta_fusion_one_end_mapped/$temp_fasta") or die "$!";
+
+print "blast every 90,000 reads to the exon db\n";
+while (my $in = <FASTA>)
+{
+	$fasta_read_count++;
+	if($fasta_read_count % 90000 == 0)
+	{
+		close (TEMP);
+		print "$fasta_read_count\t";
+		system("megablast -d $project/eeexon -i $project/fasta_fusion_one_end_mapped/$temp_fasta -p 95 -a 4 -e 1 -F F -o $project/r.txt -D 3 -W 12 ");
+		# NOTE: might need to set the -e higher. E.g, PRICKLE2_SULF2 fusion was not found at -e 1 (e = 3.6 to find the 12 base mappng to SULF2)
+		# NOTE: need to turn off the filtering. -F F
+		open (R, "$project/r.txt") or die "$!";
+		my $line;
+		$line = <R>;	# the first 4 lines are titles
+		$line = <R>;
+		$line = <R>;
+		$line = <R>;
+		while ($line = <R>)
+		{
+			print RESULT $line;
+		}
+		close (R);
+		open (TEMP, ">$project/fasta_fusion_one_end_mapped/$temp_fasta") or die "$!";
+	}
+	else
+	{
+		print TEMP $in;
+		$in = <FASTA>;
+		print TEMP $in;
+	}
+}
+print "total number of reads blasted: $fasta_read_count\n";
+close (TEMP);
+system("megablast -d $project/eeexon -i $project/fasta_fusion_one_end_mapped/$temp_fasta -p 95 -a 4 -e 1 -F F -o $project/r.txt -D 3 -W 12 ");
+open (R, "$project/r.txt") or die "$!";
+my $in = <R>;	# the first 4 lines are titles
+$in = <R>;
+$in = <R>;
+$in = <R>;
+while ($in = <R>)
+{
+	print RESULT $in;
+}
+close (R);
+close (FASTA);
+close (RESULT);
+system ("rm $project/fasta_fusion_one_end_mapped/$temp_fasta");
+system ("rm $project/r.txt");
+
+# NOTE: db: exons; query: single end reads
+print "Done blasting the single end reads\n####################################\n";
+
+print "Starting proecessing the megablast_summary file\n";
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+### FUSION JUNCTION FINDER by blasting
+###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&###&&&&&&&&&&&&&&&&&&&&&&
+# divide megablast file into 10 smaller files;		# ###&&&&&###&&&&&&&###&&&&###&&&
+my @all_sample_pairs = keys (%fusion_pair_sample);
+my $num_of_pairs = scalar (@all_sample_pairs);
+print "There are $num_of_pairs fusion candidates\n";
+my $mod_int = 1 + int ($num_of_pairs/10);
+
+my %pair_file_assign = ();	# key: pair; value: 1-10
+my %gene_assign = ();
+my $file_prefix = 0;
+
+my %file_gene_exist = ();	# key: file prefix # gene; value: ++;
+
+for (my $k=0; $k<$num_of_pairs; $k++)
+{
+	my @partners = split (/_/, $all_sample_pairs[$k]);
+	if(($k % $mod_int) == 0)		# NOTE: because 0 % NUM = 0; to avoid
+	{
+		$file_prefix++;
+		$pair_file_assign{$all_sample_pairs[$k]} = $file_prefix;
+
+		if($gene_assign{$partners[0]})
+		{
+			my $kk = $file_prefix.'#'.$partners[0];
+			if(!($file_gene_exist{$kk}))
+			{
+				$gene_assign{$partners[0]} = $gene_assign{$partners[0]}.'#'.$file_prefix;
+				$file_gene_exist{$kk}++;
+			}
+		}
+		else
+		{
+			$gene_assign{$partners[0]} = $file_prefix;
+			my $kk = $file_prefix.'#'.$partners[0];
+			$file_gene_exist{$kk}++;
+		}
+
+		if($gene_assign{$partners[1]})
+		{
+			my $kk = $file_prefix.'#'.$partners[1];
+			if(!($file_gene_exist{$kk}))
+			{
+				$gene_assign{$partners[1]} = $gene_assign{$partners[1]}.'#'.$file_prefix;
+				$file_gene_exist{$kk}++;
+			}
+		}
+		else
+		{
+			$gene_assign{$partners[1]} = $file_prefix;
+			my $kk = $file_prefix.'#'.$partners[1];
+			$file_gene_exist{$kk}++;
+		}
+
+		my $outfile_mega = $file_prefix.'_megablast.txt';
+		my $filehandle = 'FILE_'.$file_prefix;
+		open ($filehandle, ">$project/small_megablast_files/$outfile_mega");
+	}
+	else
+	{
+		$pair_file_assign{$all_sample_pairs[$k]} = $file_prefix;
+		if($gene_assign{$partners[0]})
+		{
+			my $kk = $file_prefix.'#'.$partners[0];
+			if(!($file_gene_exist{$kk}))
+			{
+				$gene_assign{$partners[0]} = $gene_assign{$partners[0]}.'#'.$file_prefix;
+				$file_gene_exist{$kk}++;
+			}
+		}
+		else
+		{
+			$gene_assign{$partners[0]} = $file_prefix;
+			my $kk = $file_prefix.'#'.$partners[0];
+			$file_gene_exist{$kk}++;
+		}
+
+		if($gene_assign{$partners[1]})
+		{
+			my $kk = $file_prefix.'#'.$partners[1];
+			if(!($file_gene_exist{$kk}))
+			{
+				$gene_assign{$partners[1]} = $gene_assign{$partners[1]}.'#'.$file_prefix;
+				$file_gene_exist{$kk}++;
+			}
+		}
+		else
+		{
+			$gene_assign{$partners[1]} = $file_prefix;
+			my $kk = $file_prefix.'#'.$partners[1];
+			$file_gene_exist{$kk}++;
+		}
+	}
+}
+print "\nReady to divide megablast files:\n";
+open (RESULT, "$project/megablast_summary.txt") or die "$!";
+$in = <RESULT>;
+while ($in = <RESULT>)
+{
+	my @arr = split (/\t/, $in);
+#	if($arr[2] >= 95)	# more than 95% identity NOTE: this was garantteed with a parameter when BLAST was run
+#	{
+		my @infor = split(/###/, $arr[0]);	# SLC2A4RG###s_1###HWI-EAS217:1:1:532:282#0/1 (NOTE: the gene here is what the other end mapped to)
+		my $gene_B = $infor[0];
+		my $sample = $infor[1];
+
+		my $gene_A;		# the gene reads mapped to in the exon database
+		if($arr[1] =~ m/lcl\|E\d/)		# exon mapping
+		#lcl|E2:chr1:HECTD3:NM_024602:45241927:45241999:-
+		{
+			my @db = split(/:/, $arr[1]);
+			$gene_A = $db[2];
+		}
+
+		my $pair;
+
+		if($gene_A ne $gene_B)
+		# this means: the entire length of the other end mapped to gene B; part of this end mapped to gene A
+		{
+			if ($gene_A lt $gene_B)	{	$pair = $gene_A.'_'.$gene_B;	}
+			else	{	$pair = $gene_B.'_'.$gene_A;	}
+			if($fusion_pair_sample{$pair}{$sample})
+			{
+				my $outfile_mega = $pair_file_assign{$pair}.'_megablast.txt';
+				my $filehandle = 'FILE_'.$pair_file_assign{$pair};
+				print $filehandle $in;
+			}
+		}
+		else # this means: the entire length of the other end mapped to gene B; part of this end mapped to gene B as well
+		{
+
+			my @gene_a = split (/#/, $gene_assign{$gene_A});
+			foreach my $a (@gene_a)
+			{
+				my $outfile_mega = $a.'_megablast.txt';
+				my $filehandle = 'FILE_'.$a;
+				print $filehandle $in;
+			}
+		}
+#	}
+}
+close (RESULT);
+
+# ###&&&&&###&&&&&&&###&&&&###&&&
+print "There are total of $file_prefix smaller megablast files created\n";
+for (my $k=1; $k<=$file_prefix; $k++)
+{
+	my $filehandle = 'FILE_'.$k;
+	close ($filehandle);
+}
+
+###### NOTE: process each megablast sub file
+my $mega_dir = "$project/small_megablast_files";
+my @all_mega_files = plainfiles ($mega_dir);
+my %junction_read = ();		# key: sample###readID;
+
+open (PRIMER, ">$project/results/mapping_good_for_primer_sequence_design.txt") or die "$!";
+print PRIMER "ReadID\tSample\tFusion_Pair\tMap1\tMap2\tOverlap\tMap-Detail1\tMap-Detail2\n";
+# print PRIMER "$read\t$sample\t$readID_pair{$read}{$sample}\t$coord[0]\t$coord[1]\t$gene_map_infor{$gg[0]}\t$gene_map_infor{$gg[1]}\n";
+foreach my $file_m (@all_mega_files)
+{
+	my %readID_map = ();	# key: read ID, sample; value: two mapping locations
+	my %readID_pair = ();	# key: read ID, sample; value: fusion pair
+	open (RESULT, "$file_m") or die "$!";
+	# Query id, Subject id, % identity, alignment length, mismatches, gap openings, q. start, q. end, s. start, s. end, e-value, bit score
+	my $in = <RESULT>;
+	while ($in = <RESULT>)
+	{
+		chomp $in;
+		my @arr = split (/\t/, $in);
+		my @infor = split(/###/, $arr[0]);	# SLC2A4RG###s_1###HWI-EAS217:1:1:532:282#0/1 (NOTE: the gene here is what the other end mapped to)
+		my $gene_B = $infor[0];
+		my $sample = $infor[1];
+		my $read = $infor[2];
+
+		my $gene_A;		# the gene reads mapped to in the exon database
+		my $pair;
+		if($arr[1] =~ m/lcl\|E\d/)		# exon mapping
+		#lcl|E2:chr1:HECTD3:NM_024602:45241927:45241999:-
+		{
+			my @db = split(/:/, $arr[1]);
+			$gene_A = $db[2];
+		}
+		if($gene_A ne $gene_B)
+		# this means: the entire length of the other end mapped to gene B; part of this end mapped to gene A
+		{
+			if ($gene_A lt $gene_B)	{	$pair = $gene_A.'_'.$gene_B;	}
+			else	{	$pair = $gene_B.'_'.$gene_A;	}
+
+			if($fusion_pair_sample{$pair}{$sample})
+			{
+				if($readID_pair{$read}{$sample})
+				{	$readID_pair{$read}{$sample} = $readID_pair{$read}{$sample}.'###'.$pair;	}
+				# because of the ambigous partners, one read might map to multiple pairs.
+				else	{	$readID_pair{$read}{$sample} = $pair;	}
+
+				if($readID_map{$read}{$sample})
+					{	$readID_map{$read}{$sample} = $readID_map{$read}{$sample}.'###'.$arr[1].':'.$arr[8].'-'.$arr[9].':'.$arr[6].'-'.$arr[7];	}
+					else	{	$readID_map{$read}{$sample} = $arr[1].':'.$arr[8].'-'.$arr[9].':'.$arr[6].'-'.$arr[7];	}
+		#			if($read =~ m/HWI-EAS217:4:43:894:1083#0\/1/)	{	print "$file_m: $read: $readID_map{$read}{$sample}\n";	}
+			}
+		}
+		else # this means: the entire length of the other end mapped to gene B; part of this end mapped to gene B as well
+		{
+			if($fusion_gene_sample{$gene_B}{$sample})
+			{
+				if($readID_map{$read}{$sample})
+				{	$readID_map{$read}{$sample} = $readID_map{$read}{$sample}.'###'.$arr[1].':'.$arr[8].'-'.$arr[9].':'.$arr[6].'-'.$arr[7];	}
+				else	{	$readID_map{$read}{$sample} = $arr[1].':'.$arr[8].'-'.$arr[9].':'.$arr[6].'-'.$arr[7];	}
+		#		if($read =~ m/HWI-EAS217:4:43:894:1083#0\/1/)	{	print "$file_m: $read: $readID_map{$read}{$sample}\n";	}
+			}
+		}
+	}
+	close (RESULT);
+
+	my $max_align_length = $config_hash{read_length}*0.9;
+	my $min_align_length = $config_hash{read_length}*0.1;
+
+	my @all_reads = keys(%readID_map);
+	foreach  my $read (@all_reads)
+	{
+		my @all_map_inf = keys (%{$readID_map{$read}});
+
+		foreach my $sample (@all_map_inf)		# for each sample
+		{
+			my @map = split(/###/, $readID_map{$read}{$sample});
+			my $num_map = scalar (@map);
+			my $num_gene = 0;	# number of genes this read map to
+			my %gene_map_infor = ();	# key: gene; value: map infor, the entire $map[$m] value (see below)
+			if($num_map >= 2)		# this takes care of the empty value of $readID_map{$key}{$subkey}
+			{
+				my %unique = ();		#key: gene symbol; value: mapping on the read
+				for(my $m=0; $m<$num_map; $m++)
+				{
+					my @fields = split (/:/, $map[$m]);
+					# lcl|E1:chr1:GNB1:NM_002074:1706588:1708352:-:113-139:1-27
+					# NOTE: OR						### NOTE: to be implemented
+					# lcl|12_E36:49_E42:49_chr7_COL1A2:NM_000089		### NOTE: to be implemented
+
+					if($unique{$fields[2]})
+					{
+						if($fields[8] eq $unique{$fields[2]}) # the area mapped on the reads. This is when the read mapped to multiple overlaping exons of the same gene
+						{
+							# if one exon mapping is to the boundary, then use that exon, other wise, keep the original mapping
+							my $size_exon = $fields[5] - $fields[4];
+							my @map_exon = split(/-/, $fields[7]);
+							if(($map_exon[0] == 1) || ($map_exon[1] == 1) || ($map_exon[0] == $size_exon) || ($map_exon[1] == $size_exon))
+							{
+								$gene_map_infor{$fields[2]} = $map[$m];
+							}
+						}
+						else
+						{
+							$num_gene = 0;	# this mean the different part of the same read map to the different parts of the same gene
+							last;
+						}
+					}
+					else
+					{
+						$unique{$fields[2]} = $fields[8];
+						$gene_map_infor{$fields[2]} = $map[$m];
+						$num_gene++;
+					}
+
+				}
+
+				#FILTERING CRITERIA:
+				# 1. single gene mapping < 45 bp;
+				# uncovered region in a junction spanning read < 5
+				# the region mapped to one partner can not be in the middle of the read
+				# the reagion mapped to one partner can not nest within the region mapp to the other partner
+				# the two regions of the read mapped to two partners can not have a gap > 5
+				# if there is a strech in the middle of the read that didn't map. discard the read
+				# for the same half mapp to multiple exons of one partner, the read start and end need to be the same
+
+				if($num_gene == 2)
+				{
+					my @coord = values(%unique);
+					my @coor1 = split (/-/, $coord[0]);
+					my @coor2 = split (/-/, $coord[1]);
+					my @all_coor = ($coor1[0], $coor1[1], $coor2[0], $coor2[1]);
+					my @sorted_coor = sort {$a<=>$b} @all_coor;
+
+					my $len1 = abs($coor1[1]-$coor1[0]);
+					my $len2 = abs($coor2[1]-$coor2[0]);
+					my $max = $len1;
+					if($len1 < $len2)	{	$max = $len2;	}
+					my $none_map = $sorted_coor[0] - 1 + 50 - $sorted_coor[3];	# the size of the region on the read that are not mapped
+
+					my @sort_coor1 = sort {$a<=>$b} @coor1;
+					my @sort_coor2 = sort {$a<=>$b} @coor2;
+					my $b1 = $sort_coor1[0] - 1;
+					my $b2 = 50 - $sort_coor1[1];
+					my $b3 = $sort_coor2[0] - 1;
+					my $b4 = 50 - $sort_coor2[1];
+
+					my $middle_map = 0;
+					if((($b1>$min_align_length) && ($b2>$min_align_length))||(($b3>$min_align_length) && ($b4>$min_align_length)))
+					{	$middle_map++;	}
+
+					my $nested = 0;
+					if(($sort_coor1[0]<=$sort_coor2[0]) && ($sort_coor1[1]>=$sort_coor2[1]))	{	$nested++;	}
+					if(($sort_coor2[0]<=$sort_coor1[0]) && ($sort_coor2[1]>=$sort_coor1[1]))	{	$nested++;	}
+
+					my $gap = 0;
+					if(($sort_coor1[0]<=$sort_coor2[0]) && ($sort_coor2[0]>($sort_coor1[1]+1)))	{	$gap++;	}
+					if(($sort_coor2[0]<=$sort_coor1[0]) && ($sort_coor1[0]>($sort_coor2[1]+1)))	{	$gap++;	}
+
+					my $overlap = 0;
+					if(($sort_coor1[0]<=$sort_coor2[0]) && ($sort_coor2[0]<=$sort_coor1[1]))	{	$overlap = $sort_coor1[1] - $sort_coor2[0] + 1;	}
+					if(($sort_coor2[0]<=$sort_coor1[0]) && ($sort_coor1[0]<=$sort_coor2[1]))	{	$overlap = $sort_coor2[1] - $sort_coor1[0] + 1;	}
+
+					my @gg = keys(%gene_map_infor);
+					if(($none_map <= $min_align_length) && ($max <= $max_align_length) && (!($middle_map)) && (!($nested)) && ($gap < 1) ) ## does allow gaps
+					{
+						my $fasta_id = $sample.'###'.$read; ## NOTE: the gene symbol is missing; but this still should be unique
+						$junction_read{$fasta_id}++;
+						print PRIMER "$read\t$sample\t$readID_pair{$read}{$sample}\t$coord[0]\t$coord[1]\t$overlap\t$gene_map_infor{$gg[0]}\t$gene_map_infor{$gg[1]}\n";
+					}
+				}
+			}
+		}
+	}
+	%readID_map = ();	# key: read ID, sample; value: two mapping locations
+	%readID_pair = ();	# key: read ID, sample; value: fusion pair
+}
+print "Done reading through the BLAST result file\n";
+close(PRIMER);
+
+open(FASTA, "$project/fasta_fusion_one_end_mapped/all_sample_one_end_mapped.fasta") or die "$!";
+while($in = <FASTA>)
+{
+	chomp $in;
+	if($in =~ m/.+###(.+###.+)$/)
+	{
+		$in = <FASTA>;
+		chomp $in;
+		if($junction_read{$1})
+		{
+			$junction_read{$1} = $in;
+		}
+
+	}
+}
+close(FASTA);
+
+open (PRIMER, "$project/results/mapping_good_for_primer_sequence_design.txt") or die "$!";
+open (PRIMER_NEW, ">$project/results/mapping_good_for_primer_sequence_design_new.txt") or die "$!";
+
+my %exon_junction = ();		# key: exon id; value: count
+
+$in = <PRIMER>;
+#Read_Seq        ReadID  Sample  Fusion_Pair     Map1    Map2    overlap	Map-Detail1     Map-Detail2
+
+print PRIMER_NEW "Read_Seq\t$in";
+while($in=<PRIMER>)
+# lcl|E1:chr1:HDGF:NM_001126051:154978522:154979871:-:342-306:14-50
+{
+	my @arr = split (/\t/, $in);
+	my $id_read = $arr[1].'###'.$arr[0];
+	print PRIMER_NEW "$junction_read{$id_read}\t$in";
+#	print "$in\n$id_read:\t$junction_read{$id_read}\n";
+#	my $pause = <STDIN>;
+
+	# get the boundary exon IDs
+	if($arr[6] =~ m/lcl\|(.+:.+:.+:.+:.+:.+:.+):.+:/)	{	$exon_junction{$1}++;	}
+	if($arr[7] =~ m/lcl\|(.+:.+:.+:.+:.+:.+:.+):.+:/)	{	$exon_junction{$1}++;	}
+}
+system ("rm $project/fasta_fusion_one_end_mapped/temp.fasta");
+%junction_read = ();
+
+close(PRIMER);
+close (PRIMER_NEW);
+system ("rm $project/results/mapping_good_for_primer_sequence_design.txt");
+
+exit;
+
+#######################################################################################################
+#sub translation
+#{
+#	my($na) = @_;
+#	my $size = length($na);
+#	my @nas = split(//, $na);
+#	my $protein;
+#	for(my $c=0; $c<$size; )
+#	{
+#		my $code = $nas[$c].$nas[$c+1].$nas[$c+2];
+#		my $aa = $codon_aa{$code};
+#		if($protein)	{	$protein = $protein.$aa;	}
+#		else	{	$protein = $aa;	}
+#		if(!($aa))
+#		{	last;	}
+#
+#		$c = $c + 3;
+#	}
+#	return $protein;
+#}
+
+sub plainfiles
+{
+   my($dir_sub) = @_;
+   my $dh = DirHandle->new($dir_sub)   or die "can't opendir : $!";
+   return sort                     # sort pathnames
+          grep {    -f     }       # choose only "plain" files
+          map  { "$dir_sub/$_" }       # create full paths
+          grep {  !/^\./   }       # filter out dot files
+          $dh->read();             # read all entries
+}
+
+sub directories
+{
+   my($dir_sub) = @_;
+   my $dh = DirHandle->new($dir_sub)   or die "can't opendir @_: $!";
+   return sort                     # sort pathnames
+          grep {    -d     }       # choose only "plain" files
+          map  { "$dir_sub/$_" }       # create full paths
+          grep {  !/^\./   }       # filter out dot files
+          $dh->read();             # read all entries
+}
+
+sub check_config{
+	my $config = shift;
+
+	my @required = qw(minimal refdata distance max_fusion_isoform snowshoes_home read_length lib_size);
+
+	foreach (@required){
+		if (!defined $config->{$_}){
+			print STDERR "ERROR: Missing required config parameter $_\n";
+			exit(-1);
+		}
+	}
+}
